@@ -1,0 +1,103 @@
+2026-02-05 11:20:03,185 - __main__ - INFO - Logging initialized. Log file: logs\ml_training\training_20260205_112003.log
+2026-02-05 11:20:03,186 - __main__ - INFO - Starting ML model training pipeline
+2026-02-05 11:20:03,186 - __main__ - INFO - Start time: 2026-02-05 11:20:03.186161
+2026-02-05 11:20:03,186 - __main__ - INFO - ============================================================
+2026-02-05 11:20:03,187 - __main__ - INFO - Loading Training Data from ML Database
+2026-02-05 11:20:03,187 - __main__ - INFO - ============================================================
+2026-02-05 11:20:03,220 - __main__ - INFO - Found 691,021 training pairs in database
+2026-02-05 11:20:03,633 - __main__ - INFO - Loaded 691,021 training pairs
+2026-02-05 11:20:03,675 - __main__ - INFO -   - Unique beneficiaries: 19,191
+2026-02-05 11:20:03,708 - __main__ - INFO -   - Unique plans: 5,124
+2026-02-05 11:20:03,751 - __main__ - INFO -   - Avg pairs per beneficiary: 36.0
+2026-02-05 11:20:03,843 - __main__ - INFO - ============================================================
+2026-02-05 11:20:03,844 - __main__ - INFO - Training LightGBM Ranking Model
+2026-02-05 11:20:03,844 - __main__ - INFO - ============================================================
+2026-02-05 11:20:04,433 - __main__ - INFO - Feature preparation complete:
+2026-02-05 11:20:04,433 - __main__ - INFO -   - Features: 22
+2026-02-05 11:20:04,433 - __main__ - INFO -   - Samples: 691,021
+2026-02-05 11:20:04,434 - __main__ - INFO -   - Groups (beneficiaries): 19,191
+2026-02-05 11:20:04,435 - __main__ - INFO -   - Target range: [1.00, 41.00]
+2026-02-05 11:20:05,714 - __main__ - INFO - Train/Test Split:
+2026-02-05 11:20:05,715 - __main__ - INFO -   Train: 551,329 samples, 15,352 beneficiaries
+2026-02-05 11:20:05,715 - __main__ - INFO -   Test: 139,692 samples, 3,839 beneficiaries
+2026-02-05 11:20:05,715 - __main__ - INFO -   Test size: 20.0%
+2026-02-05 11:20:05,715 - __main__ - INFO - Starting model training...
+2026-02-05 11:20:05,716 - __main__ - INFO - Parameters: {
+  "objective": "lambdarank",
+  "metric": "ndcg",
+  "ndcg_eval_at": [
+    3,
+    5,
+    10
+  ],
+  "learning_rate": 0.05,
+  "num_leaves": 31,
+  "max_depth": -1,
+  "min_data_in_leaf": 20,
+  "bagging_fraction": 0.8,
+  "bagging_freq": 5,
+  "feature_fraction": 0.8,
+  "verbose": -1
+}
+2026-02-05 11:20:06,001 - __main__ - ERROR - Error during training: Label 32 is not less than the number of label mappings (31)
+2026-02-05 11:20:06,007 - __main__ - ERROR - Traceback (most recent call last):
+  File "C:\Users\nghia.n\OneDrive - COLLECTIUS SYSTEMS PTE. LTD\Documents\1.Personal\1.Learning\1. Practice\master\thesis\agent-code\ml_model\train_model_from_db.py", line 307, in train
+    self.model = lgb.train(
+                 ~~~~~~~~~^
+        params,
+        ^^^^^^^
+    ...<8 lines>...
+        ]
+        ^
+    )
+    ^
+  File "C:\Users\nghia.n\OneDrive - COLLECTIUS SYSTEMS PTE. LTD\Documents\1.Personal\1.Learning\1. Practice\master\thesis\agent-code\.env\Lib\site-packages\lightgbm\engine.py", line 297, in train
+    booster = Booster(params=params, train_set=train_set)
+  File "C:\Users\nghia.n\OneDrive - COLLECTIUS SYSTEMS PTE. LTD\Documents\1.Personal\1.Learning\1. Practice\master\thesis\agent-code\.env\Lib\site-packages\lightgbm\basic.py", line 3660, in __init__
+    _safe_call(
+    ~~~~~~~~~~^
+        _LIB.LGBM_BoosterCreate(
+        ^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<3 lines>...
+        )
+        ^
+    )
+    ^
+  File "C:\Users\nghia.n\OneDrive - COLLECTIUS SYSTEMS PTE. LTD\Documents\1.Personal\1.Learning\1. Practice\master\thesis\agent-code\.env\Lib\site-packages\lightgbm\basic.py", line 313, in _safe_call
+    raise LightGBMError(_LIB.LGBM_GetLastError().decode("utf-8"))
+lightgbm.basic.LightGBMError: Label 32 is not less than the number of label mappings (31)
+
+2026-02-05 11:20:06,008 - __main__ - ERROR - ============================================================
+2026-02-05 11:20:06,008 - __main__ - ERROR - Training FAILED!
+2026-02-05 11:20:06,008 - __main__ - ERROR - ============================================================
+2026-02-05 11:20:06,008 - __main__ - ERROR - Error: Label 32 is not less than the number of label mappings (31)
+2026-02-05 11:20:06,011 - __main__ - ERROR - Traceback (most recent call last):
+  File "C:\Users\nghia.n\OneDrive - COLLECTIUS SYSTEMS PTE. LTD\Documents\1.Personal\1.Learning\1. Practice\master\thesis\agent-code\ml_model\train_model_from_db.py", line 464, in main
+    stats = model.train(training_df, test_size=0.2)
+  File "C:\Users\nghia.n\OneDrive - COLLECTIUS SYSTEMS PTE. LTD\Documents\1.Personal\1.Learning\1. Practice\master\thesis\agent-code\ml_model\train_model_from_db.py", line 307, in train
+    self.model = lgb.train(
+                 ~~~~~~~~~^
+        params,
+        ^^^^^^^
+    ...<8 lines>...
+        ]
+        ^
+    )
+    ^
+  File "C:\Users\nghia.n\OneDrive - COLLECTIUS SYSTEMS PTE. LTD\Documents\1.Personal\1.Learning\1. Practice\master\thesis\agent-code\.env\Lib\site-packages\lightgbm\engine.py", line 297, in train
+    booster = Booster(params=params, train_set=train_set)
+  File "C:\Users\nghia.n\OneDrive - COLLECTIUS SYSTEMS PTE. LTD\Documents\1.Personal\1.Learning\1. Practice\master\thesis\agent-code\.env\Lib\site-packages\lightgbm\basic.py", line 3660, in __init__
+    _safe_call(
+    ~~~~~~~~~~^
+        _LIB.LGBM_BoosterCreate(
+        ^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<3 lines>...
+        )
+        ^
+    )
+    ^
+  File "C:\Users\nghia.n\OneDrive - COLLECTIUS SYSTEMS PTE. LTD\Documents\1.Personal\1.Learning\1. Practice\master\thesis\agent-code\.env\Lib\site-packages\lightgbm\basic.py", line 313, in _safe_call
+    raise LightGBMError(_LIB.LGBM_GetLastError().decode("utf-8"))
+lightgbm.basic.LightGBMError: Label 32 is not less than the number of label mappings (31)
+
+2026-02-05 11:20:06,012 - __main__ - ERROR - Log file: logs\ml_training\training_20260205_112003.log

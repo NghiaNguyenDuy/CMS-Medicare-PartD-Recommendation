@@ -1,0 +1,77 @@
+2026-02-05 11:41:17,873 - __main__ - INFO - Logging initialized. Log file: logs\ml_training\training_20260205_114117.log
+2026-02-05 11:41:17,874 - __main__ - INFO - Starting ML model training pipeline
+2026-02-05 11:41:17,874 - __main__ - INFO - Start time: 2026-02-05 11:41:17.874342
+2026-02-05 11:41:17,875 - __main__ - INFO - ============================================================
+2026-02-05 11:41:17,875 - __main__ - INFO - Loading Training Data from ML Database
+2026-02-05 11:41:17,875 - __main__ - INFO - ============================================================
+2026-02-05 11:41:17,909 - __main__ - INFO - Found 691,021 training pairs in database
+2026-02-05 11:41:18,344 - __main__ - INFO - Loaded 691,021 training pairs
+2026-02-05 11:41:18,385 - __main__ - INFO -   - Unique beneficiaries: 19,191
+2026-02-05 11:41:18,423 - __main__ - INFO -   - Unique plans: 5,124
+2026-02-05 11:41:18,467 - __main__ - INFO -   - Avg pairs per beneficiary: 36.0
+2026-02-05 11:41:18,582 - __main__ - INFO - ============================================================
+2026-02-05 11:41:18,582 - __main__ - INFO - Training LightGBM Ranking Model
+2026-02-05 11:41:18,583 - __main__ - INFO - ============================================================
+2026-02-05 11:41:23,376 - __main__ - INFO - Feature preparation complete:
+2026-02-05 11:41:23,377 - __main__ - INFO -   - Features: 22
+2026-02-05 11:41:23,377 - __main__ - INFO -   - Samples: 691,021
+2026-02-05 11:41:23,377 - __main__ - INFO -   - Groups (beneficiaries): 19,191
+2026-02-05 11:41:23,379 - __main__ - INFO -   - Target range: [0.00, 30.00]
+2026-02-05 11:41:24,542 - __main__ - INFO - Train/Test Split:
+2026-02-05 11:41:24,543 - __main__ - INFO -   Train: 551,329 samples, 15,352 beneficiaries
+2026-02-05 11:41:24,543 - __main__ - INFO -   Test: 139,692 samples, 3,839 beneficiaries
+2026-02-05 11:41:24,543 - __main__ - INFO -   Test size: 20.0%
+2026-02-05 11:41:24,544 - __main__ - INFO - Starting model training...
+2026-02-05 11:41:24,544 - __main__ - INFO - Parameters: {
+  "objective": "lambdarank",
+  "metric": "ndcg",
+  "ndcg_eval_at": [
+    3,
+    5,
+    10
+  ],
+  "learning_rate": 0.05,
+  "num_leaves": 31,
+  "max_depth": -1,
+  "min_data_in_leaf": 20,
+  "bagging_fraction": 0.8,
+  "bagging_freq": 5,
+  "feature_fraction": 0.8,
+  "verbose": -1
+}
+2026-02-05 11:41:29,495 - __main__ - INFO - Training complete!
+2026-02-05 11:41:29,495 - __main__ - INFO -   Best iteration: 13
+2026-02-05 11:41:29,496 - __main__ - INFO -   Best NDCG@3: 0.2508
+2026-02-05 11:41:29,496 - __main__ - INFO -   Best NDCG@5: 0.2692
+2026-02-05 11:41:29,496 - __main__ - INFO -   Best NDCG@10: 0.3275
+2026-02-05 11:41:29,543 - __main__ - INFO - ============================================================
+2026-02-05 11:41:29,544 - __main__ - INFO - Top 15 Feature Importance
+2026-02-05 11:41:29,544 - __main__ - INFO - ============================================================
+2026-02-05 11:41:29,552 - __main__ - INFO - 
+                     feature  importance
+              distance_miles  576.723562
+        premium_to_oop_ratio  353.455020
+               cost_per_drug  287.178859
+     formulary_specialty_pct  251.383058
+              total_drug_oop  244.603140
+                     premium  201.241591
+           formulary_pa_rate  190.492179
+                  deductible  185.188919
+       formulary_generic_pct  175.854012
+          avg_fills_per_year  163.958510
+                   num_drugs   88.163190
+              annual_premium   76.777300
+           formulary_st_rate   68.980680
+           formulary_ql_rate   66.958010
+network_preferred_pharmacies   40.886490
+2026-02-05 11:41:29,557 - __main__ - INFO - Model saved to models/plan_ranker.pkl
+2026-02-05 11:41:29,558 - __main__ - INFO - Model size: 49.91 KB
+2026-02-05 11:41:29,564 - __main__ - INFO - Training results saved to logs\ml_training\results\training_results_20260205_114129.json
+2026-02-05 11:41:29,564 - __main__ - INFO - ============================================================
+2026-02-05 11:41:29,571 - __main__ - INFO - ============================================================
+2026-02-05 11:41:29,572 - __main__ - INFO - Duration: 11.69 seconds
+2026-02-05 11:41:29,572 - __main__ - INFO - Model saved to: models/plan_ranker.pkl
+2026-02-05 11:41:29,572 - __main__ - INFO - Test NDCG@3: 0.2508
+2026-02-05 11:41:29,572 - __main__ - INFO - Test NDCG@5: 0.2692
+2026-02-05 11:41:29,572 - __main__ - INFO - Log file: logs\ml_training\training_20260205_114117.log
+2026-02-05 11:41:29,573 - __main__ - INFO - Results file: logs\ml_training\results\training_results_20260205_114129.json
