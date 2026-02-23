@@ -32,14 +32,20 @@ def ingest_insulin_reference():
     print("Bronze Ingestion: Insulin Reference Data")
     print("=" * 60)
     
-    # Read CSV
-    insulin_file = Path("data/insulin_ref.csv")
-    if not insulin_file.exists():
-        print(f"ERROR: {insulin_file} not found!")
+    # Read CSV (support current and legacy locations)
+    candidate_files = [
+        Path("data/insulin_ref.csv"),
+        Path("data/temp/insulin_ref.csv"),
+    ]
+    insulin_file = next((path for path in candidate_files if path.exists()), None)
+    if insulin_file is None:
+        print("ERROR: insulin_ref.csv not found in data/ or data/temp/")
         return False
     
     print(f"\n1. Loading {insulin_file}...")
-    df = pd.read_csv(insulin_file, dtype={"ndc": str, "rxcui": str}).drop("Unnamed: 0", axis=1)
+    df = pd.read_csv(insulin_file, dtype={"ndc": str, "rxcui": str})
+    if "Unnamed: 0" in df.columns:
+        df = df.drop(columns=["Unnamed: 0"])
     print(f"   ✓ Loaded {len(df):,} insulin NDCs")
     
     # Add metadata

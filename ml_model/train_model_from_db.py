@@ -2,7 +2,8 @@
 Train LightGBM Ranking Model using ML Schema Database
 
 This script trains a ranking model using the pre-processed ml.training_plan_pairs table.
-The model learns to rank plans by suitability for beneficiaries.
+The model learns to rank plans by objective cost for each beneficiary:
+annual premium + out-of-pocket + distance penalty.
 
 Data Source: ml.training_plan_pairs (created by db/ml/05_training_pairs.py)
 Output: models/plan_ranker.pkl (model artifact for streamlit)
@@ -15,7 +16,6 @@ import pandas as pd
 import numpy as np
 import lightgbm as lgb
 from sklearn.model_selection import GroupShuffleSplit
-from sklearn.metrics import ndcg_score
 import pickle
 from pathlib import Path
 import sys
@@ -28,6 +28,7 @@ import traceback
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from db.db_manager import get_db
+from ml_model.ranking_utils import create_ranking_labels_from_cost, groups_are_contiguous
 
 
 # ===== Logging Setup =====
@@ -86,7 +87,7 @@ class PlanRankingModel:
         logger.info("Loading Training Data from ML Database")
         logger.info("="*60)
         
-        db = get_db()
+        db = get_db(read_only=True)
         
         # Check if training pairs exist
         try:
@@ -136,7 +137,15 @@ class PlanRankingModel:
                 
                 -- Cost features (TARGET)
                 CAST(estimated_annual_oop AS DOUBLE) as total_drug_oop,
-                CAST(plan_premium * 12 + estimated_annual_oop AS DOUBLE) as total_annual_cost
+                CAST(
+                    COALESCE(total_annual_cost, plan_premium * 12 + estimated_annual_oop) AS DOUBLE
+                ) as total_annual_cost,
+                CAST(
+                    COALESCE(
+                        total_cost_with_distance,
+                        plan_premium * 12 + estimated_annual_oop + COALESCE(distance_penalty, 0)
+                    ) AS DOUBLE
+                ) as ranking_cost_objective
                 
             FROM ml.training_plan_pairs
             WHERE plan_premium IS NOT NULL
@@ -177,6 +186,11 @@ class PlanRankingModel:
         """
         print("\nPreparing features for ranking model...")
         
+        # Deterministic ordering keeps group boundaries stable for reproducible training.
+        ordered_df = training_df.sort_values(
+            ["bene_synth_id", "plan_key"]
+        ).reset_index(drop=True)
+
         # Feature columns (aligned with actual schema)
         feature_cols = [
             # Plan features
@@ -196,7 +210,7 @@ class PlanRankingModel:
         ]
         
         # Extract features
-        X = training_df[feature_cols].copy()
+        X = ordered_df[feature_cols].copy()
         
         # Add interaction features
         X['annual_premium'] = X['premium'] * 12
@@ -205,35 +219,14 @@ class PlanRankingModel:
         
         feature_cols.extend(['annual_premium', 'cost_per_drug', 'premium_to_oop_ratio'])
         
-        # Target: Convert total_annual_cost to relevance score
-        # LightGBM ranker requires labels to be 0-based integers within each group
-        # Lower cost = higher relevance (higher label value)
-        def create_ranking_labels(group):
-            # Rank by total_annual_cost (ascending), then convert to 0-based labels
-            # Lowest cost gets highest label (N-1), highest cost gets 0
-            ranks = group['total_annual_cost'].rank(method='dense', ascending=True)
-            # Convert to 0-based: subtract 1 so labels start from 0
-            labels = ranks - 1
-            # Invert so lowest cost = highest label
-            max_label = labels.max()
-            inverted_labels = max_label - labels
-            
-            # Cap labels at 30 (LightGBM's maximum is 31 unique labels: 0-30)
-            # If beneficiary has more than 31 plans, compress labels to 0-30 range
-            if max_label > 30:
-                # Scale labels proportionally to 0-30 range
-                inverted_labels = (inverted_labels * 30 / max_label).round().astype(int)
-                # Ensure still 0-based and capped at 30
-                inverted_labels = np.clip(inverted_labels, 0, 30)
-            
-            return inverted_labels
-        
-        y = training_df.groupby('bene_synth_id', group_keys=False).apply(
-            create_ranking_labels
-        ).values
-        
-        # Groups: Beneficiary IDs
-        groups = training_df.groupby('bene_synth_id').size().values
+        # Target: objective cost = annual premium + OOP + distance penalty.
+        y_parts = []
+        for _, group in ordered_df.groupby("bene_synth_id", sort=False):
+            y_parts.append(create_ranking_labels_from_cost(group["ranking_cost_objective"]))
+        y = np.concatenate(y_parts).astype(int)
+
+        # Groups: counts in row order expected by LightGBM ranker.
+        groups = ordered_df.groupby("bene_synth_id", sort=False).size().to_numpy()
         
         self.feature_names = feature_cols
         
@@ -248,7 +241,7 @@ class PlanRankingModel:
         for col in feature_cols:
             logger.debug(f"  - {col}: mean={X[col].mean():.2f}, std={X[col].std():.2f}")
         
-        return X, y, groups
+        return X, y, groups, ordered_df
     
     def train(self, training_df, test_size=0.2, random_state=42):
         """
@@ -267,20 +260,38 @@ class PlanRankingModel:
         logger.info("="*60)
         
         # Prepare data
-        X, y, groups = self.prepare_training_data(training_df)
+        X, y, _, ordered_df = self.prepare_training_data(training_df)
         
         # Split by beneficiary (group-based split)
         splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
-        train_idx, test_idx = next(splitter.split(X, y, groups=training_df['bene_synth_id']))
-        
-        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-        y_train, y_test = y[train_idx], y[test_idx]
-        
-        # Recalculate groups for train/test
-        train_bene_ids = training_df.iloc[train_idx]['bene_synth_id']
-        test_bene_ids = training_df.iloc[test_idx]['bene_synth_id']
-        train_groups = train_bene_ids.value_counts().sort_index().values
-        test_groups = test_bene_ids.value_counts().sort_index().values
+        train_idx, test_idx = next(splitter.split(X, y, groups=ordered_df["bene_synth_id"]))
+
+        # Preserve original sorted order so each beneficiary remains contiguous.
+        train_idx = np.sort(train_idx)
+        test_idx = np.sort(test_idx)
+
+        X_train = X.iloc[train_idx].reset_index(drop=True)
+        X_test = X.iloc[test_idx].reset_index(drop=True)
+        y_train = y[train_idx]
+        y_test = y[test_idx]
+
+        train_bene_ids = ordered_df.iloc[train_idx]["bene_synth_id"].to_numpy()
+        test_bene_ids = ordered_df.iloc[test_idx]["bene_synth_id"].to_numpy()
+        train_groups = (
+            ordered_df.iloc[train_idx]
+            .groupby("bene_synth_id", sort=False)
+            .size()
+            .to_numpy()
+        )
+        test_groups = (
+            ordered_df.iloc[test_idx]
+            .groupby("bene_synth_id", sort=False)
+            .size()
+            .to_numpy()
+        )
+
+        if not groups_are_contiguous(train_bene_ids) or not groups_are_contiguous(test_bene_ids):
+            raise ValueError("Non-contiguous groups detected after split.")
         
         logger.info("Train/Test Split:")
         logger.info(f"  Train: {len(X_train):,} samples, {len(train_groups):,} beneficiaries")

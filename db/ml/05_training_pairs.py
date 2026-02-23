@@ -6,7 +6,8 @@ Generate beneficiary-plan training pairs with features:
 - Geographic compatibility (county matching)
 - Distance features (pharmacy accessibility)
 - Network adequacy
-- Estimated annual out-of-pocket cost (TARGET)
+- Objective cost components for ranking:
+  annual premium + estimated annual out-of-pocket + distance penalty
 
 Creates:
     ml.training_plan_pairs - Training data for recommender model
@@ -85,9 +86,6 @@ def generate_training_pairs():
             CAST(p.DEDUCTIBLE AS DOUBLE) AS plan_deductible,
             COALESCE(p.snp, 0) AS plan_snp,
             
-            -- Cost estimate (simplified - from bene profile)
-            COALESCE(b.total_rx_cost_est, 5000) AS estimated_annual_oop,
-            
             -- Formulary metrics
             COALESCE(fm.total_drugs, 0) AS formulary_total_drugs,
             COALESCE(fm.generic_tier_pct, 0) AS formulary_generic_pct,
@@ -113,7 +111,7 @@ def generate_training_pairs():
                 ELSE 0.0
             END AS distance_penalty,
             
-            -- In real scenario, this would use detailed cost calculation
+            -- Estimated annual out-of-pocket drug cost
             LEAST(b.total_rx_cost_est * 0.25, 
                   p.deductible + (b.fills_target * 20.0)) AS estimated_annual_oop,
             
@@ -147,10 +145,16 @@ def generate_training_pairs():
     print("\n3. Adding derived features...")
     db.execute("""
         ALTER TABLE ml.training_plan_pairs
+        ADD COLUMN total_annual_cost DECIMAL(10,2);
+        
+        UPDATE ml.training_plan_pairs
+        SET total_annual_cost = (plan_premium * 12) + estimated_annual_oop;
+        
+        ALTER TABLE ml.training_plan_pairs
         ADD COLUMN total_cost_with_distance DECIMAL(10,2);
         
         UPDATE ml.training_plan_pairs
-        SET total_cost_with_distance = estimated_annual_oop + distance_penalty;
+        SET total_cost_with_distance = total_annual_cost + distance_penalty;
         
         -- Add tradeoff flag
         ALTER TABLE ml.training_plan_pairs

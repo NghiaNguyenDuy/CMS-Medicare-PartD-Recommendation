@@ -52,7 +52,7 @@ def assign_zip_codes():
         ALTER TABLE synthetic.syn_beneficiary 
         ADD COLUMN IF NOT EXISTS density INTEGER;
         
-        -- Assign zip codes using window function for random selection
+        -- Assign zip codes deterministically for reproducible pipeline runs
         WITH county_zips AS (
             SELECT
                 z.county_code,
@@ -60,24 +60,35 @@ def assign_zip_codes():
                 z.lat,
                 z.lng,
                 z.density,
-                z.population,
-                -- Population weight within county
-                z.population * 1.0 / NULLIF(SUM(z.population) OVER (PARTITION BY z.county_code), 0) AS zip_weight
+                z.population
             FROM bronze.brz_zipcode z
             --WHERE z.population IS NOT NULL AND z.population > 0
         ),
-        bene_zip_assignment AS (
+        bene_zip_candidates AS (
             SELECT
                 b.bene_synth_id,
                 b.county_code,
-                -- Randomly pick one zip per beneficiary within county
-                (ARRAY_AGG(z.zip_code ORDER BY RANDOM()))[1] AS assigned_zip,
-                (ARRAY_AGG(z.lat ORDER BY RANDOM()))[1] AS assigned_lat,
-                (ARRAY_AGG(z.lng ORDER BY RANDOM()))[1] AS assigned_lng,
-                (ARRAY_AGG(z.density ORDER BY RANDOM()))[1] AS assigned_density
+                z.zip_code,
+                z.lat,
+                z.lng,
+                z.density,
+                ROW_NUMBER() OVER (
+                    PARTITION BY b.bene_synth_id
+                    ORDER BY HASH(b.bene_synth_id || ':' || COALESCE(z.zip_code, ''))
+                ) AS zip_rank
             FROM synthetic.syn_beneficiary b
             JOIN county_zips z ON b.county_code = z.county_code
-            GROUP BY b.bene_synth_id, b.county_code
+        ),
+        bene_zip_assignment AS (
+            SELECT
+                bene_synth_id,
+                county_code,
+                zip_code AS assigned_zip,
+                lat AS assigned_lat,
+                lng AS assigned_lng,
+                density AS assigned_density
+            FROM bene_zip_candidates
+            WHERE zip_rank = 1
         )
         UPDATE synthetic.syn_beneficiary b
         SET 

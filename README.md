@@ -423,7 +423,7 @@ data/SPUF/
 
 ```bash
 # Migrate SPUF parquet files to DuckDB
-python scripts/migrate_to_duckdb.py --force
+python scripts/migrate_to_duckdb.py --force  # one-time bootstrap only
 ```
 
 **Expected Output:**
@@ -433,7 +433,7 @@ python scripts/migrate_to_duckdb.py --force
 
 **Validation:**
 ```bash
-python -c "from db.db_manager import get_db; db = get_db(); print('Tables:', len([t for t in db.sql('SHOW TABLES').fetchall()]))"
+python -c "from db.db_manager import get_db; db = get_db(read_only=True); print('Tables:', len(db.list_tables()))"
 ```
 
 #### 4. Add Reference Data
@@ -524,7 +524,7 @@ python ml_model/train_model_from_db.py
 source .env/bin/activate  # macOS/Linux
 
 # Run complete pipeline
-python scripts/migrate_to_duckdb.py --force
+python scripts/migrate_to_duckdb.py --force  # one-time bootstrap only
 python db/bronze/06_ingest_insulin_ref.py
 python db/bronze/05_ingest_geography.py
 python db/gold/03_dim_zipcode.py
@@ -646,7 +646,7 @@ For each recommended plan, shows:
 ```python
 from db.db_manager import get_db
 
-db = get_db()
+db = get_db(read_only=True)
 
 # Get all MA-PD plans in LA County
 query = """
@@ -661,7 +661,7 @@ WHERE p.COUNTY_CODE = '06037'  -- LA County
 ORDER BY p.PREMIUM
 """
 
-plans_df = db.sql(query).df()
+plans_df = db.query_df(query)
 print(plans_df.head())
 ```
 
@@ -679,7 +679,7 @@ FROM gold.agg_plan_formulary_metrics fm
 WHERE fm.PLAN_KEY = 'H1234-001-000'
 """
 
-metrics = db.sql(query).df().iloc[0]
+metrics = db.query_df(query).iloc[0]
 print(f"Coverage: {metrics['formulary_breadth_pct']:.1%}")
 print(f"PA Rate: {metrics['pa_rate']:.1%}")
 ```
@@ -699,7 +699,7 @@ WHERE bene_synth_id = 'BENE_00001'
 ORDER BY recommendation_rank
 """
 
-recommendations = db.sql(query).df()
+recommendations = db.query_df(query)
 print(recommendations)
 ```
 
@@ -826,13 +826,13 @@ agent-code/
 │   ├── utils/                         # Database utilities
 │   │   └── validate_schema.py
 │   ├── db_manager.py                  # Database connection manager
-│   ├── plan_repository.py             # Plan data access
-│   └── formulary_repository.py        # Formulary data access
+│   ├── run_full_pipeline.py           # Layer orchestration
+│   └── README.md                      # Executable db module map
 │
 ├── ml_model/                          # ML model training
 │   ├── train_model_from_db.py         # LightGBM training from DuckDB ⭐
-│   ├── train_ranking_model.py         # (Legacy: parquet-based)
-│   └── feature_engineering.py         # (Legacy: parquet-based)
+│   ├── ranking_utils.py               # Ranking label/group utilities
+│   └── __init__.py
 │
 ├── app/                               # Streamlit applications
 │   └── streamlit_app_interactive.py   # Real-time ML inference app ⭐
@@ -840,7 +840,7 @@ agent-code/
 ├── scripts/                           # ETL and utility scripts
 │   ├── migrate_to_duckdb.py           # SPUF → DuckDB migration ⭐
 │   ├── generate_beneficiary_profiles.py  # Synthetic beneficiaries
-│   └── load_cms_raw.py                # (Legacy: parquet ETL)
+│   └── spark_version/                 # Legacy notebook experiments
 │
 ├── models/
 │   └── plan_ranker.pkl                # Trained LightGBM model ⭐
@@ -935,7 +935,7 @@ python ml_model/train_model_from_db.py
 Or use pre-computed recommendations (no model needed):
 
 ```bash
-streamlit run app/streamlit_app_ml.py  # Uses ml.recommendation_explanations
+streamlit run app/streamlit_app_interactive.py
 ```
 
 #### 5. No Plans Found for County

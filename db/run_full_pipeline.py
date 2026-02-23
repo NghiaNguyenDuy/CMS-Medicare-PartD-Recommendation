@@ -1,17 +1,18 @@
 """
 Full Pipeline Orchestrator
 
-Runs the complete DuckDB medallion pipeline:
-1. Bronze: Raw ingestion
-2. Silver: Transformations
-3. Gold: Dimensions & aggregations
-4. ML: Feature engineering & training data
+Runs the DuckDB medallion pipeline:
+1. Bronze: Reference ingestion
+2. Silver: Placeholder (not implemented)
+3. Gold: Aggregations
+4. ML: Feature engineering and recommendation outputs
 """
 
-import sys
-from pathlib import Path
 import argparse
+import importlib
+import sys
 from datetime import datetime
+from pathlib import Path
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -19,156 +20,141 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from db.db_manager import get_db
 
 
+def run_step(module_path, function_name):
+    """Import module dynamically and run a target function."""
+    module = importlib.import_module(module_path)
+    fn = getattr(module, function_name)
+    result = fn()
+    return result is not False
+
+
 def run_pipeline(layers=None, force=False):
     """
     Run full medallion pipeline.
-    
+
     Args:
-        layers (list): Specific layers to run, e.g., ['bronze', 'silver']
-                      If None, runs all layers
-        force (bool): Force recreation of tables
+        layers (list): Specific layers to run, e.g., ['bronze', 'gold']
+        force (bool): Reserved for future forced rebuild behavior
     """
-    all_layers = ['bronze', 'silver', 'gold', 'ml']
+    all_layers = ["bronze", "silver", "gold", "ml"]
     layers_to_run = layers if layers else all_layers
-    
+
     print("=" * 70)
     print("DuckDB Medallion Pipeline")
     print("=" * 70)
-    print(f"\nStarted: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Layers: {', '.join(layers_to_run)}")
     print(f"Force: {force}")
     print("=" * 70)
-    
+
     results = {}
-    
-    # 1. Bronze Layer
-    if 'bronze' in layers_to_run:
-        print("\n\n" + "=" * 70)
-        print("BRONZE LAYER: Raw Ingestion")
+
+    if "bronze" in layers_to_run:
+        print("\n" + "=" * 70)
+        print("BRONZE LAYER: Reference Ingestion")
         print("=" * 70)
-        
-        # Check if migrate_to_duckdb has been run
+
         db = get_db()
         tables = db.list_tables()
-        
-        if not any('brz_plan_info' in t for t in tables):
-            print("\n⚠️  Bronze tables not found!")
-            print("Please run: python scripts/migrate_to_duckdb.py --force")
+        if not any("brz_plan_info" in t for t in tables):
+            print("[ERROR] bronze.brz_plan_info not found.")
+            print("Run one-time bootstrap first: python scripts/migrate_to_duckdb.py --force")
             return False
-        
-        # Run bronze scripts
+
         try:
-            print("\n▶ Running bronze.05_ingest_geography...")
-            from db.bronze import ingest_geography
-            results['bronze_geography'] = ingest_geography.ingest_zipcode_geo()
-        except Exception as e:
-            print(f"❌ Bronze layer failed: {e}")
-            results['bronze'] = False
-    
-    # 2. Silver Layer
-    if 'silver' in layers_to_run:
-        print("\n\n" + "=" * 70)
+            print("Running db.bronze.05_ingest_geography.ingest_zipcode_geo ...")
+            results["bronze_geography"] = run_step(
+                "db.bronze.05_ingest_geography",
+                "ingest_zipcode_geo",
+            )
+        except Exception as exc:
+            print(f"[ERROR] Bronze layer failed: {exc}")
+            results["bronze"] = False
+
+    if "silver" in layers_to_run:
+        print("\n" + "=" * 70)
         print("SILVER LAYER: Transformations")
         print("=" * 70)
-        print("\n⚠️  Silver layer scripts not yet implemented")
-        print("Using existing bronze tables directly for now...")
-        results['silver'] = True
-    
-    # 3. Gold Layer
-    if 'gold' in layers_to_run:
-        print("\n\n" + "=" * 70)
-        print("GOLD LAYER: Dimensions & Aggregations")
+        print("[INFO] Silver layer scripts are not implemented in this repository.")
+        results["silver"] = True
+
+    if "gold" in layers_to_run:
+        print("\n" + "=" * 70)
+        print("GOLD LAYER: Dimensions and Aggregations")
         print("=" * 70)
-        
-        try:
-            print("\n▶ Running gold.03_dim_zipcode...")
-            from db.gold import dim_zipcode
-            results['gold_zipcode'] = dim_zipcode.create_dim_zipcode()
-            
-            print("\n▶ Running gold.05_agg_formulary...")
-            from db.gold import agg_formulary
-            results['gold_formulary'] = agg_formulary.create_formulary_metrics()
-            
-            print("\n▶ Running gold.07_agg_networks...")
-            from db.gold import agg_networks
-            results['gold_networks'] = agg_networks.create_network_metrics()
-            
-        except Exception as e:
-            print(f"❌ Gold layer failed: {e}")
-            import traceback
-            traceback.print_exc()
-            results['gold'] = False
-    
-    # 4. ML Layer
-    if 'ml' in layers_to_run:
-        print("\n\n" + "=" * 70)
+        gold_steps = [
+            ("db.gold.03_dim_zipcode", "create_dim_zipcode", "gold_dim_zipcode"),
+            ("db.gold.05_agg_formulary", "create_formulary_metrics", "gold_formulary"),
+            ("db.gold.07_agg_networks", "create_network_metrics", "gold_networks"),
+            ("db.gold.06_agg_cost", "create_cost_metrics", "gold_cost"),
+            ("db.gold.08_affordability_index_pca", "calculate_affordability_index", "gold_affordability"),
+        ]
+        for module_path, function_name, result_key in gold_steps:
+            try:
+                print(f"Running {module_path}.{function_name} ...")
+                results[result_key] = run_step(module_path, function_name)
+            except Exception as exc:
+                print(f"[ERROR] Gold step failed ({module_path}): {exc}")
+                results[result_key] = False
+
+    if "ml" in layers_to_run:
+        print("\n" + "=" * 70)
         print("ML LAYER: Feature Engineering")
         print("=" * 70)
-        
+
+        db = get_db()
         try:
-            # Check if synthetic beneficiaries exist
-            db = get_db()
-            try:
-                bene_count = db.query_one("SELECT COUNT(*) FROM synthetic.syn_beneficiary")[0]
-                print(f"\n✓ Found {bene_count:,} synthetic beneficiaries")
-                
-                print("\n▶ Running ml.02_assign_geography...")
-                from db.ml import assign_geography
-                results['ml_geography'] = assign_geography.assign_zip_codes()
-                
-                print("\n▶ Running ml.03_calculate_distance...")
-                from db.ml import calculate_distance
-                results['ml_distance'] = calculate_distance.calculate_distance_proxy()
-                
-                print("\n▶ Running ml.05_training_pairs...")
-                from db.ml import training_pairs
-                results['ml_training'] = training_pairs.generate_training_pairs()
-                
-                print("\n▶ Running ml.06_recommendation_explainer...")
-                from db.ml import recommendation_explainer
-                results['ml_explainer'] = recommendation_explainer.create_recommendation_explanations()
-                
-            except:
-                print("\n⚠️  synthetic.syn_beneficiary table not found")
-                print("Please generate synthetic beneficiaries first.")
-                results['ml'] = False
-        except Exception as e:
-            print(f"❌ ML layer failed: {e}")
-            import traceback
-            traceback.print_exc()
-            results['ml'] = False
-    
-    # Summary
-    print("\n\n" + "=" * 70)
+            bene_count = db.query_one("SELECT COUNT(*) FROM synthetic.syn_beneficiary")[0]
+            print(f"Found {bene_count:,} synthetic beneficiaries")
+        except Exception:
+            print("[ERROR] synthetic.syn_beneficiary not found.")
+            print("Run: python scripts/generate_beneficiary_profiles.py")
+            results["ml"] = False
+            bene_count = 0
+
+        if bene_count > 0:
+            ml_steps = [
+                ("db.ml.02_assign_geography", "assign_zip_codes", "ml_geography"),
+                ("db.ml.03_calculate_distance", "calculate_distance_proxy", "ml_distance"),
+                ("db.ml.05_training_pairs", "generate_training_pairs", "ml_training"),
+                ("db.ml.06_recommendation_explainer", "create_recommendation_explanations", "ml_explainer"),
+            ]
+            for module_path, function_name, result_key in ml_steps:
+                try:
+                    print(f"Running {module_path}.{function_name} ...")
+                    results[result_key] = run_step(module_path, function_name)
+                except Exception as exc:
+                    print(f"[ERROR] ML step failed ({module_path}): {exc}")
+                    results[result_key] = False
+
+    print("\n" + "=" * 70)
     print("PIPELINE SUMMARY")
     print("=" * 70)
-    
-    for layer, success in results.items():
-        status = "✓" if success else "❌"
-        print(f"{status} {layer}")
-    
-    print(f"\nCompleted: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    for step_name, success in results.items():
+        status = "[OK]" if success else "[FAIL]"
+        print(f"{status} {step_name}")
+
+    print(f"Completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 70)
-    
-    return all(results.values())
+
+    return bool(results) and all(results.values())
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Run DuckDB medallion pipeline')
+    parser = argparse.ArgumentParser(description="Run DuckDB medallion pipeline")
     parser.add_argument(
-        '--layers',
-        nargs='+',
-        choices=['bronze', 'silver', 'gold', 'ml'],
-        help='Specific layers to run (default: all)'
+        "--layers",
+        nargs="+",
+        choices=["bronze", "silver", "gold", "ml"],
+        help="Specific layers to run (default: all)",
     )
     parser.add_argument(
-        '--force',
-        action='store_true',
-        help='Force recreation of tables'
+        "--force",
+        action="store_true",
+        help="Reserved for future force rebuild behavior",
     )
-    
     args = parser.parse_args()
-    
+
     success = run_pipeline(layers=args.layers, force=args.force)
     sys.exit(0 if success else 1)
 
