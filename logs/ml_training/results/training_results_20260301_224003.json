@@ -1,0 +1,74 @@
+{
+  "timestamp": "20260301_224003",
+  "log_file": "logs\\ml_training\\training_20260301_223929.log",
+  "training_stats": {
+    "best_iteration": 259,
+    "train_ndcg@3": 1.0,
+    "test_ndcg@3": 1.0,
+    "train_ndcg@5": 0.999997195866803,
+    "test_ndcg@5": 0.9999570465307349
+  },
+  "feature_importance": [
+    {
+      "feature": "premium",
+      "importance": 276566.7887391988
+    },
+    {
+      "feature": "distance_miles",
+      "importance": 246380.60978933237
+    },
+    {
+      "feature": "annual_premium",
+      "importance": 109546.72474188171
+    },
+    {
+      "feature": "formulary_generic_pct",
+      "importance": 24441.718132667243
+    },
+    {
+      "feature": "premium_to_oop_ratio",
+      "importance": 9413.581793420017
+    },
+    {
+      "feature": "has_distance_tradeoff",
+      "importance": 9049.997195420787
+    },
+    {
+      "feature": "network_preferred_pharmacies",
+      "importance": 7066.006164653227
+    },
+    {
+      "feature": "formulary_ql_rate",
+      "importance": 5162.556957900524
+    },
+    {
+      "feature": "formulary_st_rate",
+      "importance": 3628.8964013252407
+    },
+    {
+      "feature": "formulary_specialty_pct",
+      "importance": 3601.295795906335
+    },
+    {
+      "feature": "formulary_pa_rate",
+      "importance": 3193.104128655046
+    },
+    {
+      "feature": "network_total_pharmacies",
+      "importance": 2584.2528128027916
+    },
+    {
+      "feature": "network_adequacy_flag",
+      "importance": 1798.5327150784433
+    },
+    {
+      "feature": "deductible",
+      "importance": 1497.499519430101
+    },
+    {
+      "feature": "formulary_restrictiveness",
+      "importance": 767.8657612297684
+    }
+  ],
+  "model_path": "models/plan_ranker.pkl"
+}

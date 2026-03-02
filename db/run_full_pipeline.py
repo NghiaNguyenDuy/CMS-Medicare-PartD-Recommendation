@@ -106,6 +106,12 @@ def run_pipeline(layers=None, force=False):
         try:
             bene_count = db.query_one("SELECT COUNT(*) FROM synthetic.syn_beneficiary")[0]
             print(f"Found {bene_count:,} synthetic beneficiaries")
+            try:
+                rx_count = db.query_one("SELECT COUNT(*) FROM synthetic.syn_beneficiary_prescriptions")[0]
+                print(f"Found {rx_count:,} synthetic beneficiary prescriptions")
+            except Exception:
+                print("[WARN] synthetic.syn_beneficiary_prescriptions not found.")
+                print("       Re-run: python scripts/generate_beneficiary_profiles.py")
         except Exception:
             print("[ERROR] synthetic.syn_beneficiary not found.")
             print("Run: python scripts/generate_beneficiary_profiles.py")

@@ -203,13 +203,16 @@ JOIN bronze.brz_plan_info p
 
 | Source | Target | Script | Method |
 |--------|--------|--------|--------|
-| `data/pde.csv` (optional) OR generated | `synthetic.syn_beneficiary` | `scripts/generate_beneficiary_profiles.py` | PDE aggregation or synthetic generation |
+| `data/pde.csv` (optional) OR generated | `synthetic.syn_beneficiary` | `scripts/generate_beneficiary_profiles.py` | Beneficiary-level profile generation |
+| `bronze.brz_basic_formulary` + `bronze.brz_insulin_ref` + `data/rxcui_info/*.csv` | `synthetic.syn_beneficiary_prescriptions` | `scripts/generate_beneficiary_profiles.py` | Beneficiary-level prescription synthesis + RXCUI drug-name enrichment |
 
 **Two Modes**:
 
 1. **PDE Mode** (`--from-pde`):
    - Aggregate fills by bene_id + ndc
+   - Restrict to CMS-covered NDCs via `bronze.brz_basic_formulary`
    - Join with `bronze.brz_insulin_ref` for insulin flagging
+   - Enrich drug names from `data/rxcui_info/*.csv`
    - Calculate risk from total_rx_cost
 
 2. **Synthetic Mode (Default)**:
@@ -217,6 +220,8 @@ JOIN bronze.brz_plan_info p
    - Assign risk_segment (50% LOW, 30% MED, 20% HIGH)
    - Set insulin_user_flag (~15%)
    - Generate fills/cost based on risk
+   - Enforce at least one insulin drug for insulin users (if available in pool)
+   - Enrich drug names from `data/rxcui_info/*.csv`
 
 **Justification**: Flexible approach - use real PDE if available, else generate realistic synthetic data from actual formulary.
 

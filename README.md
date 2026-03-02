@@ -238,6 +238,7 @@ flowchart LR
 | Table | Rows | Purpose |
 |-------|------|---------|
 | `synthetic.syn_beneficiary` | 10,000 | Test beneficiary profiles | `bene_synth_id`, location, `unique_drugs`, `insulin_user_flag`, `risk_segment` |
+| `synthetic.syn_beneficiary_prescriptions` | ~40K-70K | Beneficiary-level synthetic prescriptions sampled from CMS formulary coverage and RXCUI naming reference | `bene_synth_id`, `ndc`, `rxcui`, `drug_name`, `fills_per_year`, `is_insulin`, restriction flags |
 
 ---
 
@@ -475,9 +476,11 @@ python scripts/generate_beneficiary_profiles.py
 
 **Expected Output:**
 - `synthetic.syn_beneficiary` table with 10K rows
+- `synthetic.syn_beneficiary_prescriptions` table with beneficiary-level drug rows
 - County assignments based on plan availability
 - ~15% insulin users
-- Realistic drug utilization patterns
+- Drug utilization patterns based on CMS-covered formulary NDCs
+- Drug names enriched from `data/rxcui_info/*.csv`
 
 #### 7. Create ML Layer (Feature Engineering)
 
@@ -567,8 +570,8 @@ Opens in browser at `http://localhost:8501`
 
 - **State & County Selection**: Choose location from dropdown
 - **Medication List**: 
-  - Enter NDC codes directly, OR
   - Search by drug name (autocomplete)
+  - Select matched medications (app maps selections to covered NDCs internally)
   - Add multiple medications
 - **Additional Inputs**:
   - Number of annual fills per drug

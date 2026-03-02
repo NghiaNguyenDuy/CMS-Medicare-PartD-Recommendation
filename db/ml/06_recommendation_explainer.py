@@ -204,7 +204,7 @@ def create_recommendation_explanations():
     if len(sample) > 0:
         print(f"\n   Beneficiary: {sample['bene_synth_id'][0]}")
         for _, row in sample.iterrows():
-            print(f"\n   Rank {row['recommendation_rank']}: {row['plan_key']}")
+            print(f"\n   Rank {row['recommendation_rank']}: {row['PLAN_KEY']}")
             print(f"   {row['recommendation_label']}")
             print(f"   {row['cost_explanation']}")
             print(f"   {row['distance_explanation']}")

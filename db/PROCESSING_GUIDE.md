@@ -220,7 +220,10 @@ If you need synthetic beneficiary data for testing:
 python scripts/generate_beneficiary_profiles.py
 ```
 
-**Note:** This creates `synthetic.syn_beneficiary` table which is required for ML layer.
+**Note:** This creates:
+- `synthetic.syn_beneficiary`
+- `synthetic.syn_beneficiary_prescriptions` (beneficiary-level CMS-covered drug rows)
+- Drug names in prescriptions are enriched from `data/rxcui_info/*.csv`
 
 ### Step 5: ML Layer - Feature Engineering and Training Data
 

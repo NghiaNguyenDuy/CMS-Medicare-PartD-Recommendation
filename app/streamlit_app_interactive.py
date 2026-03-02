@@ -290,13 +290,18 @@ def compute_decision_support_scores(plans_df, decision_weights):
     pa_component = normalize_series(ranked['formulary_pa_rate'], False)
     st_component = normalize_series(ranked['formulary_st_rate'], False)
     ql_component = normalize_series(ranked['formulary_ql_rate'], False)
-    ranked['coverage_component'] = (
+    baseline_coverage_component = (
         0.35 * generic_component
         + 0.25 * restrictive_component
         + 0.20 * pa_component
         + 0.10 * st_component
         + 0.10 * ql_component
     )
+    if 'drug_coverage_pct' in ranked.columns:
+        requested_drug_component = normalize_series(ranked['drug_coverage_pct'], True)
+        ranked['coverage_component'] = 0.55 * requested_drug_component + 0.45 * baseline_coverage_component
+    else:
+        ranked['coverage_component'] = baseline_coverage_component
 
     ranked['decision_score'] = 100 * (
         decision_weights['ml'] * ranked['ml_component']
@@ -313,6 +318,8 @@ def compute_decision_support_scores(plans_df, decision_weights):
             signals.append("good pharmacy access")
         if row['coverage_component'] >= 0.70:
             signals.append("favorable formulary profile")
+        if 'drug_coverage_pct' in row and float(row['drug_coverage_pct']) >= 90:
+            signals.append("high requested-drug coverage")
         if row['ml_component'] >= 0.70:
             signals.append("high ML suitability")
         return ", ".join(signals[:2]) if signals else "balanced across factors"
@@ -335,13 +342,13 @@ def get_states():
 def get_counties(state_name):
     """Get counties for a state (full names)."""
     db = get_database()
-    query = f"""
+    query = """
         SELECT DISTINCT county 
         FROM gold.dim_zipcode 
-        WHERE state = '{state_name}'
+        WHERE state = ?
         ORDER BY county
     """
-    counties = db.query_df(query)['county'].tolist()
+    counties = db.query_df(query, [state_name])['county'].tolist()
     return counties
 
 
@@ -349,13 +356,13 @@ def get_counties(state_name):
 def get_location_from_zip(zip_code):
     """Get state and county from zip code."""
     db = get_database()
-    query = f"""
+    query = """
         SELECT state, county, city
         FROM gold.dim_zipcode
-        WHERE zip_code = '{zip_code}'
+        WHERE zip_code = ?
         LIMIT 1
     """
-    result = db.query_df(query)
+    result = db.query_df(query, [zip_code])
     if len(result) > 0:
         return result.iloc[0].to_dict()
     return None
@@ -365,16 +372,16 @@ def get_location_from_zip(zip_code):
 def get_default_zip_for_county(state_name, county_name):
     """Get a representative ZIP code for county-level search fallback."""
     db = get_database()
-    query = f"""
+    query = """
         SELECT zip_code
         FROM gold.dim_zipcode
-        WHERE state = '{state_name}'
-          AND county = '{county_name}'
+        WHERE state = ?
+          AND county = ?
           AND zip_code IS NOT NULL
         ORDER BY population DESC NULLS LAST, zip_code
         LIMIT 1
     """
-    result = db.query_df(query)
+    result = db.query_df(query, [state_name, county_name])
     if len(result) == 0:
         return None
     return str(result['zip_code'].iloc[0])
@@ -385,14 +392,14 @@ def get_state_county_codes(state_name, county_name):
     """Get state and county codes for querying plans."""
     db = get_database()
     # Get state code (2-letter)
-    state_query = f"""
+    state_query = """
         SELECT DISTINCT z.state as state_name, p.STATE as state_code
         FROM gold.dim_zipcode z
         JOIN bronze.brz_plan_info p ON z.county_code = p.COUNTY_CODE
-        WHERE z.state = '{state_name}'
+        WHERE z.state = ?
         LIMIT 1
     """
-    state_result = db.query_df(state_query)
+    state_result = db.query_df(state_query, [state_name])
     
     if len(state_result) == 0:
         return None, None
@@ -400,13 +407,13 @@ def get_state_county_codes(state_name, county_name):
     state_code = state_result['state_code'].iloc[0]
     
     # Get county code
-    county_query = f"""
+    county_query = """
         SELECT DISTINCT county_code
         FROM gold.dim_zipcode
-        WHERE state = '{state_name}' AND county = '{county_name}'
+        WHERE state = ? AND county = ?
         LIMIT 1
     """
-    county_result = db.query_df(county_query)
+    county_result = db.query_df(county_query, [state_name, county_name])
     
     if len(county_result) == 0:
         return state_code, None
@@ -439,11 +446,11 @@ def get_nearby_counties(user_zip, state_name, max_distance_miles=50):
     db = get_database()
     
     # SQL query with Haversine formula
-    query = f"""
+    query = """
     WITH beneficiary_loc AS (
         SELECT AVG(lat) as lat, AVG(lng) as lng
         FROM gold.dim_zipcode
-        WHERE zip_code = '{user_zip}'
+        WHERE zip_code = ?
     ),
     county_centers AS (
         SELECT 
@@ -453,7 +460,7 @@ def get_nearby_counties(user_zip, state_name, max_distance_miles=50):
             AVG(lat) as clat,
             AVG(lng) as clng
         FROM gold.dim_zipcode
-        WHERE state = '{state_name}'
+        WHERE state = ?
         GROUP BY county_code, state, county
     )
     county_distances AS (
@@ -478,11 +485,11 @@ def get_nearby_counties(user_zip, state_name, max_distance_miles=50):
     )
     SELECT *
     FROM county_distances
-    WHERE distance_miles <= {max_distance_miles}
+    WHERE distance_miles <= ?
     ORDER BY distance_miles
     """
     
-    nearby = db.query_df(query)
+    nearby = db.query_df(query, [user_zip, state_name, max_distance_miles])
     return nearby
 
 
@@ -501,11 +508,12 @@ def get_plans_for_location(state, county_code):
     """
     db = get_database()
     
-    query = f"""
+    query = """
         SELECT
             p.PLAN_KEY,
             p.PLAN_NAME,
             p.CONTRACT_NAME,
+            p.FORMULARY_ID,
             CASE WHEN p.IS_MA_PD THEN 'MA' WHEN p.IS_PDP THEN 'PDP' ELSE 'Other' END as contract_type,
             CAST(p.PREMIUM AS DOUBLE) as premium,
             CAST(p.DEDUCTIBLE AS DOUBLE) as deductible,
@@ -530,13 +538,170 @@ def get_plans_for_location(state, county_code):
         FROM bronze.brz_plan_info p
         LEFT JOIN gold.agg_plan_formulary_metrics fm ON p.PLAN_KEY = fm.PLAN_KEY
         LEFT JOIN gold.agg_plan_network_metrics nm ON p.PLAN_KEY = nm.plan_key
-        WHERE p.STATE = '{state}'
-            AND p.COUNTY_CODE = '{county_code}'
+        WHERE p.STATE = ?
+            AND p.COUNTY_CODE = ?
             AND p.PREMIUM IS NOT NULL
     """
     
-    plans_df = db.query_df(query)
+    plans_df = db.query_df(query, [state, county_code])
     return plans_df
+
+
+@st.cache_data(ttl=1800)
+def search_drug_catalog(query_text, limit=20):
+    """
+    Search beneficiary-level synthetic prescriptions by drug name.
+    """
+    query_text = str(query_text or "").strip().lower()
+    if len(query_text) < 2:
+        return pd.DataFrame(columns=["drug_name", "ndc"])
+
+    db = get_database()
+    like_value = f"%{query_text}%"
+    try:
+        sql = """
+            SELECT DISTINCT
+                CAST(
+                    COALESCE(
+                        NULLIF(drug_name, ''),
+                        NULLIF(drug_synonym, ''),
+                        CONCAT('NDC ', ndc)
+                    ) AS VARCHAR
+                ) AS drug_name,
+                CAST(ndc AS VARCHAR) AS ndc
+            FROM synthetic.syn_beneficiary_prescriptions
+            WHERE (
+                    LOWER(COALESCE(drug_name, '')) LIKE ?
+                    OR LOWER(COALESCE(drug_synonym, '')) LIKE ?
+                  )
+              AND ndc IS NOT NULL
+            ORDER BY drug_name, ndc
+            LIMIT ?
+        """
+        return db.query_df(sql, [like_value, like_value, int(limit)])
+    except Exception:
+        # Fallback for older table versions that may not include drug_synonym.
+        try:
+            fallback_sql = """
+                SELECT DISTINCT
+                    CAST(COALESCE(NULLIF(drug_name, ''), CONCAT('NDC ', ndc)) AS VARCHAR) AS drug_name,
+                    CAST(ndc AS VARCHAR) AS ndc
+                FROM synthetic.syn_beneficiary_prescriptions
+                WHERE LOWER(COALESCE(drug_name, '')) LIKE ?
+                  AND ndc IS NOT NULL
+                ORDER BY drug_name, ndc
+                LIMIT ?
+            """
+            return db.query_df(fallback_sql, [like_value, int(limit)])
+        except Exception:
+            return pd.DataFrame(columns=["drug_name", "ndc"])
+
+
+@st.cache_data(ttl=1800)
+def get_plan_drug_coverage(plan_keys, requested_ndcs):
+    """
+    Compute requested-drug coverage for each candidate plan.
+
+    Args:
+        plan_keys (tuple[str]): Candidate PLAN_KEYs
+        requested_ndcs (tuple[str]): Requested drug NDCs
+
+    Returns:
+        pd.DataFrame: PLAN_KEY-level requested-drug coverage summary
+    """
+    plan_keys = tuple(str(pk) for pk in (plan_keys or ()))
+    requested_ndcs = tuple(str(ndc) for ndc in (requested_ndcs or ()))
+
+    if len(plan_keys) == 0 or len(requested_ndcs) == 0:
+        return pd.DataFrame(columns=[
+            "PLAN_KEY",
+            "requested_drugs",
+            "covered_drugs",
+            "in_formulary_drugs",
+            "excluded_drugs",
+            "uncovered_ndcs",
+            "drug_coverage_pct",
+        ])
+
+    db = get_database()
+    plan_placeholders = ", ".join(["?"] * len(plan_keys))
+    requested_union = " UNION ALL ".join(["SELECT ? AS ndc"] * len(requested_ndcs))
+
+    sql = f"""
+        WITH candidate_plans AS (
+            SELECT DISTINCT
+                PLAN_KEY,
+                FORMULARY_ID
+            FROM bronze.brz_plan_info
+            WHERE PLAN_KEY IN ({plan_placeholders})
+        ),
+        requested AS (
+            {requested_union}
+        ),
+        grid AS (
+            SELECT
+                cp.PLAN_KEY,
+                cp.FORMULARY_ID,
+                r.ndc
+            FROM candidate_plans cp
+            CROSS JOIN (SELECT DISTINCT ndc FROM requested) r
+        ),
+        coverage_raw AS (
+            SELECT
+                g.PLAN_KEY,
+                g.FORMULARY_ID,
+                g.ndc,
+                bf.RXCUI,
+                bf.NDC AS covered_ndc
+            FROM grid g
+            LEFT JOIN bronze.brz_basic_formulary bf
+                ON bf.FORMULARY_ID = g.FORMULARY_ID
+               AND bf.NDC = g.ndc
+        ),
+        coverage_eval AS (
+            SELECT
+                c.PLAN_KEY,
+                c.ndc,
+                CASE
+                    WHEN c.covered_ndc IS NULL THEN 0
+                    WHEN ex.RXCUI IS NOT NULL THEN 0
+                    ELSE 1
+                END AS is_covered,
+                CASE WHEN c.covered_ndc IS NOT NULL THEN 1 ELSE 0 END AS in_formulary,
+                CASE WHEN ex.RXCUI IS NOT NULL THEN 1 ELSE 0 END AS is_excluded
+            FROM coverage_raw c
+            LEFT JOIN bronze.brz_excluded_drugs ex
+                ON ex.FORMULARY_ID = c.FORMULARY_ID
+               AND ex.RXCUI = c.RXCUI
+        )
+        SELECT
+            PLAN_KEY,
+            COUNT(*) AS requested_drugs,
+            SUM(is_covered) AS covered_drugs,
+            SUM(in_formulary) AS in_formulary_drugs,
+            SUM(is_excluded) AS excluded_drugs,
+            STRING_AGG(
+                CASE WHEN is_covered = 0 THEN ndc ELSE NULL END,
+                ', ' ORDER BY ndc
+            ) AS uncovered_ndcs
+        FROM coverage_eval
+        GROUP BY PLAN_KEY
+    """
+
+    params = list(plan_keys) + list(requested_ndcs)
+    coverage_df = db.query_df(sql, params)
+
+    if len(coverage_df) == 0:
+        return coverage_df
+
+    coverage_df["requested_drugs"] = pd.to_numeric(coverage_df["requested_drugs"], errors="coerce").fillna(0)
+    coverage_df["covered_drugs"] = pd.to_numeric(coverage_df["covered_drugs"], errors="coerce").fillna(0)
+    coverage_df["drug_coverage_pct"] = np.where(
+        coverage_df["requested_drugs"] > 0,
+        100.0 * coverage_df["covered_drugs"] / coverage_df["requested_drugs"],
+        0.0,
+    )
+    return coverage_df
 
 
 @st.cache_data(ttl=3600)
@@ -675,20 +840,20 @@ def get_plan_pharmacy_distances(plan_keys, user_zip):
     db = get_database()
     
     # Get user location
-    user_loc = db.query_df(f"""
+    user_loc = db.query_df("""
         SELECT lat, lng
         FROM gold.dim_zipcode
-        WHERE zip_code = '{user_zip}'
+        WHERE zip_code = ?
         LIMIT 1
-    """)
+    """, [user_zip])
     
     if len(user_loc) == 0:
         return pd.DataFrame()
     
     user_lat, user_lng = user_loc.iloc[0]['lat'], user_loc.iloc[0]['lng']
     
-    # Build plan keys list for SQL IN clause
-    plan_keys_str = ','.join([f"'{pk}'" for pk in plan_keys])
+    # Build plan key placeholders for parameterized IN clause
+    plan_placeholders = ", ".join(["?"] * len(plan_keys))
     
     # Get pharmacies and calculate distances
     query = f"""
@@ -707,21 +872,22 @@ def get_plan_pharmacy_distances(plan_keys, user_zip):
         ROUND(
             6371 * ACOS(
                 GREATEST(-1, LEAST(1,
-                    COS(RADIANS({user_lat})) * COS(RADIANS(z.lat)) *
-                    COS(RADIANS(z.lng) - RADIANS({user_lng})) +
-                    SIN(RADIANS({user_lat})) * SIN(RADIANS(z.lat))
+                    COS(RADIANS(?)) * COS(RADIANS(z.lat)) *
+                    COS(RADIANS(z.lng) - RADIANS(?)) +
+                    SIN(RADIANS(?)) * SIN(RADIANS(z.lat))
                 ))
             ) * 0.621371,  -- Convert km to miles
             2
         ) as distance_miles
     FROM bronze.brz_pharmacy_network pn
     JOIN gold.dim_zipcode z ON pn.PHARMACY_ZIPCODE = z.zip_code
-    WHERE pn.PLAN_KEY IN ({plan_keys_str})
+    WHERE pn.PLAN_KEY IN ({plan_placeholders})
         AND pn.PHARMACY_TYPE = 'retail'  -- Focus on retail pharmacies
     ORDER BY pn.PLAN_KEY, distance_miles
     """
     
-    pharmacy_dist = db.query_df(query)
+    params = [float(user_lat), float(user_lng), float(user_lat)] + list(plan_keys)
+    pharmacy_dist = db.query_df(query, params)
     return pharmacy_dist
 
 
@@ -782,7 +948,7 @@ def get_county_pharmacy_plan_links(state_code, county_code):
     """
     db = get_database()
 
-    query = f"""
+    query = """
     SELECT
         pn.PHARMACY_NUMBER,
         pn.PHARMACY_ZIPCODE,
@@ -804,14 +970,14 @@ def get_county_pharmacy_plan_links(state_code, county_code):
       ON p.PLAN_KEY = pn.PLAN_KEY
     JOIN gold.dim_zipcode z
       ON pn.PHARMACY_ZIPCODE = z.zip_code
-    WHERE p.STATE = '{state_code}'
-      AND p.COUNTY_CODE = '{county_code}'
-      AND LPAD(CAST(z.county_code AS VARCHAR), 5, '0') = '{county_code}'
+    WHERE p.STATE = ?
+      AND p.COUNTY_CODE = ?
+      AND LPAD(CAST(z.county_code AS VARCHAR), 5, '0') = ?
       AND z.lat IS NOT NULL
       AND z.lng IS NOT NULL
     """
 
-    return db.query_df(query)
+    return db.query_df(query, [state_code, county_code, county_code])
 
 
 def build_county_pharmacy_summary(pharmacy_links_df):
@@ -1116,6 +1282,44 @@ def main():
     num_drugs = st.sidebar.number_input("Number of medications", min_value=1, max_value=20, value=3)
     avg_fills_per_year = st.sidebar.number_input("Average fills per year", min_value=1, max_value=100, value=12)
     is_insulin_user = st.sidebar.checkbox("Insulin user")
+    st.sidebar.caption("Optional: filter plans by requested drug names.")
+
+    enable_drug_filter = st.sidebar.checkbox(
+        "Filter plans by requested drugs",
+        value=False,
+        help="When enabled, plans are evaluated against selected medications."
+    )
+    drug_name_query = st.sidebar.text_input(
+        "Search medication name",
+        value="",
+        placeholder="Type at least 2 characters",
+        disabled=not enable_drug_filter
+    )
+    drug_lookup = search_drug_catalog(drug_name_query, limit=25) if enable_drug_filter else pd.DataFrame()
+    drug_lookup_options = []
+    option_to_ndc = {}
+    if len(drug_lookup) > 0:
+        for _, row in drug_lookup.iterrows():
+            option_label = f"{row['drug_name']} [NDC {row['ndc']}]"
+            if option_label not in option_to_ndc:
+                option_to_ndc[option_label] = str(row["ndc"])
+                drug_lookup_options.append(option_label)
+    selected_drug_options = st.sidebar.multiselect(
+        "Select medications",
+        options=drug_lookup_options,
+        default=[],
+        disabled=(not enable_drug_filter or len(drug_lookup_options) == 0)
+    )
+    selected_drug_ndcs = [option_to_ndc[o] for o in selected_drug_options if o in option_to_ndc]
+    min_drug_coverage_pct = st.sidebar.slider(
+        "Minimum requested-drug coverage (%)",
+        min_value=0,
+        max_value=100,
+        value=100,
+        step=5,
+        disabled=not enable_drug_filter,
+        help="100% = every requested drug must be covered."
+    )
     
     st.sidebar.markdown("---")
     
@@ -1202,6 +1406,15 @@ def main():
     
     # ===== Main Content Area =====
     if get_recommendations:
+        requested_ndcs = tuple(dict.fromkeys(selected_drug_ndcs))
+        requested_name_map = {
+            option_to_ndc[o]: o.split(" [NDC ", 1)[0]
+            for o in selected_drug_options
+            if o in option_to_ndc
+        }
+        if enable_drug_filter and len(requested_ndcs) > 0:
+            num_drugs = max(int(num_drugs), len(requested_ndcs))
+
         # Get state and county codes for querying
         state_code, county_code = get_state_county_codes(state_name, county_name)
         
@@ -1228,6 +1441,13 @@ def main():
         }
         
         st.info(f"📊 Finding plans for: **{state_name}, {county_name}** | {num_drugs} medications | ${total_rx_cost_est:,.0f}/year")
+        if enable_drug_filter:
+            if len(requested_ndcs) > 0:
+                st.caption(
+                    f"Drug filter active: {len(requested_ndcs)} selected medication(s), minimum coverage {min_drug_coverage_pct}%."
+                )
+            else:
+                st.caption("Drug filter enabled, but no medications were selected. Proceeding without drug filter.")
         if effective_zip and effective_zip != zip_code_input:
             st.caption(f"Using county representative ZIP for distance-aware ranking: `{effective_zip}`")
         
@@ -1268,6 +1488,41 @@ def main():
         else:
             st.warning(f"⚠️ **No plans found** in {county_name}. Enable 'Include nearby counties' to search wider.")
             st.stop()
+
+        if enable_drug_filter and len(requested_ndcs) > 0:
+            coverage_df = get_plan_drug_coverage(
+                tuple(plans_df["PLAN_KEY"].astype(str).tolist()),
+                tuple(requested_ndcs),
+            )
+            if len(coverage_df) > 0:
+                plans_df = plans_df.merge(coverage_df, on="PLAN_KEY", how="left")
+                for col, fill_value in [
+                    ("requested_drugs", len(requested_ndcs)),
+                    ("covered_drugs", 0),
+                    ("in_formulary_drugs", 0),
+                    ("excluded_drugs", 0),
+                    ("drug_coverage_pct", 0.0),
+                ]:
+                    plans_df[col] = pd.to_numeric(plans_df[col], errors="coerce").fillna(fill_value)
+                plans_df["uncovered_ndcs"] = plans_df["uncovered_ndcs"].fillna("")
+
+                eligible_plans = plans_df[plans_df["drug_coverage_pct"] >= float(min_drug_coverage_pct)].copy()
+                if len(eligible_plans) == 0:
+                    st.warning(
+                        f"No plans met {min_drug_coverage_pct}% requested-drug coverage. "
+                        "Showing highest-coverage plans instead."
+                    )
+                    plans_df = plans_df.sort_values(
+                        ["drug_coverage_pct", "premium"],
+                        ascending=[False, True]
+                    ).reset_index(drop=True)
+                else:
+                    plans_df = eligible_plans.reset_index(drop=True)
+                    st.success(
+                        f"Drug coverage filter retained {len(plans_df):,} plans at >= {min_drug_coverage_pct}% coverage."
+                    )
+            else:
+                st.warning("Could not evaluate requested-drug coverage for current plans.")
         
         # Rank plans using ML model
         with st.spinner("Ranking plans using ML model..."):
@@ -1322,6 +1577,20 @@ def main():
                 col_b.metric("Est. Drug Out-of-Pocket", f"${plan['estimated_annual_oop']:,.2f}")
                 col_c.metric("Decision Score", f"{plan['decision_score']:.1f}")
                 col_d.metric("ML Ranking Score", f"{plan['score']:.2f}")
+
+                if enable_drug_filter and len(requested_ndcs) > 0 and 'drug_coverage_pct' in plan:
+                    st.markdown("**🧬 Requested Drug Coverage:**")
+                    d1, d2, d3 = st.columns(3)
+                    d1.metric("Coverage %", f"{float(plan.get('drug_coverage_pct', 0.0)):.1f}%")
+                    d2.metric("Covered Drugs", f"{int(float(plan.get('covered_drugs', 0)))}")
+                    d3.metric("Excluded Drugs", f"{int(float(plan.get('excluded_drugs', 0)))}")
+                    uncovered = str(plan.get('uncovered_ndcs', '') or '').strip()
+                    if uncovered:
+                        uncovered_display = []
+                        for ndc in [t.strip() for t in uncovered.split(",") if t.strip()]:
+                            name = requested_name_map.get(ndc, "")
+                            uncovered_display.append(f"{name} (NDC {ndc})" if name else f"NDC {ndc}")
+                        st.caption(f"Uncovered requested medications: {', '.join(uncovered_display)}")
                 
                 
                 # Location & Distance info
@@ -1446,6 +1715,11 @@ def main():
             'decision_score', 'decision_reason', 'score',
             'network_preferred_pharmacies', 'network_total_pharmacies'
         ]].copy()
+        if 'drug_coverage_pct' in top_5.columns:
+            report_df['drug_coverage_pct'] = top_5['drug_coverage_pct']
+            report_df['covered_drugs'] = top_5.get('covered_drugs', 0)
+            report_df['requested_drugs'] = top_5.get('requested_drugs', 0)
+            report_df['uncovered_ndcs'] = top_5.get('uncovered_ndcs', "")
         
         csv = report_df.to_csv(index=False)
         st.download_button(
@@ -1466,8 +1740,9 @@ def main():
         
         #### How It Works:
         1. **Enter beneficiary information** in the sidebar (location, medications, costs)
-        2. **Click "Get Plan Recommendations"** to run real-time ML inference
-        3. **Review ranked plans** with cost breakdowns, network info, and warnings
+        2. *(Optional)* Search and select medication names to enforce drug-based plan coverage filtering
+        3. **Click "Get Plan Recommendations"** to run real-time ML inference
+        4. **Review ranked plans** with cost breakdowns, network info, and warnings
         
         #### What You'll Get:
         - ✅ **Top 5 AI-ranked plans** optimized for the beneficiary's needs
