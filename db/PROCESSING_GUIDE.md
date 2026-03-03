@@ -255,6 +255,7 @@ python -m db.run_full_pipeline --layers ml
 **Training pairs:**
 - Beneficiary-plan combinations with county constraints
 - Plan features + distance + OOP estimates
+- OOP is computed with SPUF-style rules (copay/coinsurance, deductible applicability, insulin copay handling, uncovered-drug burden)
 
 **Recommendation explanations:**
 - Top 5 recommendations per beneficiary

@@ -322,7 +322,13 @@ The system creates **18+ features** for each beneficiary-plan pair:
 - `has_distance_tradeoff` (BOOLEAN): 1 if plan is far but cheap
 
 #### 6. Target Variable
-- `total_cost_with_distance` (DECIMAL): Annual premium (×12) + estimated OOP + distance penalty
+- total_cost_with_distance (DECIMAL): annual premium (x12) + estimated OOP + distance penalty
+
+estimated_annual_oop is computed from beneficiary-level prescription baskets (synthetic.syn_beneficiary_prescriptions) using SPUF-style approximations:
+- preferred-retail COST_TYPE_PREF + COST_AMT_PREF from bronze.brz_beneficiary_cost
+- deductible applicability (DED_APPLIES_YN / DEDUCTIBLE_APPLIES) with beneficiary-level deductible allocation
+- insulin copay rows from bronze.brz_insulin_cost with 30-day-equivalent cap proxy
+- uncovered/excluded formulary drug matches treated as full gross cost burden
 
 ### Model Training & Outputs
 
@@ -1097,3 +1103,4 @@ For questions, feedback, or collaboration:
 **Last Updated**: February 6, 2026  
 **Version**: 2.0  
 **Database**: medicare_part_d.duckdb (SPUF 2025 Q3)
+

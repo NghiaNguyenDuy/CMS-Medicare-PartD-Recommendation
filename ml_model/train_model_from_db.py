@@ -142,6 +142,7 @@ class PlanRankingModel:
                 ) as total_annual_cost,
                 CAST(
                     COALESCE(
+                        ranking_cost_objective,
                         total_cost_with_distance,
                         plan_premium * 12 + estimated_annual_oop + COALESCE(distance_penalty, 0)
                     ) AS DOUBLE

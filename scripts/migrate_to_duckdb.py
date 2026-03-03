@@ -1,5 +1,5 @@
 """
-Database Migration Script: Parquet → DuckDB
+Database Migration Script: Parquet -> DuckDB
 
 This script migrates SPUF data from parquet files to a DuckDB database
 for improved I/O performance and memory efficiency.
@@ -50,7 +50,7 @@ class DuckDBMigration:
         
         # # Remove existing database if force=True
         # if self.db_path.exists() and force:
-        #     print(f"🗑️  Removing existing database: {self.db_path}")
+        #     print(f"  Removing existing database: {self.db_path}")
         #     self.db_path.unlink()
         
         # # Create parent directory
@@ -58,7 +58,7 @@ class DuckDBMigration:
         
         # Connect to DuckDB
         self.conn = duckdb.connect(str(self.db_path))
-        print(f"✓ Connected to DuckDB: {self.db_path}")
+        print(f"[OK] Connected to DuckDB: {self.db_path}")
     
     def migrate_table(self, table_name, parquet_file, schema_sql=None, index_sqls=None,
                       transform_fn=None):
@@ -72,13 +72,13 @@ class DuckDBMigration:
             index_sqls (list): Optional list of SQL statements to create indexes
             transform_fn (callable): Optional function to transform data before import
         """
-        print(f"\n📊 Migrating {table_name}...")
+        print(f"\n[INFO] Migrating {table_name}...")
         start_time = time.time()
         
         parquet_path = self.parquet_dir / parquet_file
         
         if not parquet_path.exists():
-            print(f"  ⚠️  Parquet file not found: {parquet_path}")
+            print(f"  [WARN] Parquet file not found: {parquet_path}")
             return False
         
         # Get file size
@@ -130,12 +130,12 @@ class DuckDBMigration:
                     self.conn.execute(idx_sql)
             
             elapsed = time.time() - start_time
-            print(f"  ✓ {row_count:,} rows migrated in {elapsed:.2f}s")
+            print(f"  [OK] {row_count:,} rows migrated in {elapsed:.2f}s")
             
             return True
             
         except Exception as e:
-            print(f"  ❌ Error migrating {table_name}: {e}")
+            print(f"  [ERROR] Error migrating {table_name}: {e}")
             import traceback
             traceback.print_exc()
             return False
@@ -145,13 +145,15 @@ class DuckDBMigration:
         Run full migration of all SPUF tables.
         """
         print("="*60)
-        print("DuckDB Migration: Parquet → Bronze Layer")
+        print("DuckDB Migration: Parquet -> Bronze Layer")
         print("="*60)
         
         # Create bronze schema first
-        print("\n📂 Creating bronze schema...")
-        # self.conn.execute("CREATE SCHEMA IF NOT EXISTS bronze;")
-        # self.conn.execute("CREATE SCHEMA IF NOT EXISTS synthetic;")
+        print("\n[INFO] Creating bronze schema...")
+        self.conn.execute("CREATE SCHEMA IF NOT EXISTS bronze;")
+        self.conn.execute("CREATE SCHEMA IF NOT EXISTS synthetic;")
+        self.conn.execute("CREATE SCHEMA IF NOT EXISTS gold;")
+        self.conn.execute("CREATE SCHEMA IF NOT EXISTS ml;")
         
         # Track success
         results = {}
@@ -256,7 +258,21 @@ class DuckDBMigration:
         #         ]
         #     )
         
-        # 8. Pharmacy Networks (needs PLAN_KEY)
+        # 8. Pricing (SPUF pricing parquet already contains PLAN_KEY + DAYS_SUPPLY_CODE)
+        if (self.parquet_dir / 'pricing.parquet').exists():
+            results['bronze.brz_pricing'] = self.migrate_table(
+                table_name='bronze.brz_pricing',
+                parquet_file='pricing.parquet',
+                index_sqls=[
+                    "CREATE INDEX idx_pricing_plan ON bronze.brz_pricing(PLAN_KEY)",
+                    "CREATE INDEX idx_pricing_ndc ON bronze.brz_pricing(NDC)",
+                    "CREATE INDEX idx_pricing_days ON bronze.brz_pricing(DAYS_SUPPLY_CODE)",
+                    "CREATE INDEX idx_pricing_lookup ON bronze.brz_pricing(PLAN_KEY, NDC, DAYS_SUPPLY_CODE)",
+                    "CREATE INDEX idx_pricing_key ON bronze.brz_pricing(PRICING_KEY)"
+                ]
+            )
+
+        # 9. Pharmacy Networks (needs PLAN_KEY)
         if (self.parquet_dir / 'pharmacy_network.parquet').exists():
             results['bronze.brz_pharmacy_network'] = self.migrate_table(
                 table_name='bronze.brz_pharmacy_network',
@@ -272,7 +288,7 @@ class DuckDBMigration:
         # # 9. Beneficiary Profiles (synthetic data)
         # beneficiary_path = Path('data/synthetic/beneficiary_profiles.csv')
         # if beneficiary_path.exists():
-        #     print(f"\n📊 Migrating synthetic.beneficiary_profiles...")
+        #     print(f"\n Migrating synthetic.beneficiary_profiles...")
         #     start_time = time.time()
             
         #     self.conn.execute("DROP TABLE IF EXISTS synthetic.beneficiary_profiles")
@@ -286,7 +302,7 @@ class DuckDBMigration:
             
         #     row_count = self.conn.execute("SELECT COUNT(*) FROM synthetic.beneficiary_profiles").fetchone()[0]
         #     elapsed = time.time() - start_time
-        #     print(f"  ✓ {row_count:,} rows migrated in {elapsed:.2f}s")
+        #     print(f"   {row_count:,} rows migrated in {elapsed:.2f}s")
         #     results['synthetic.beneficiary_profiles'] = True
         
         # Summary
@@ -297,10 +313,10 @@ class DuckDBMigration:
         successful = sum(1 for v in results.values() if v)
         total = len(results)
         
-        print(f"✓ {successful}/{total} tables migrated successfully")
+        print(f"[OK] {successful}/{total} tables migrated successfully")
         
         for table, success in results.items():
-            status = "✓" if success else "✗"
+            status = "[OK]" if success else "[FAIL]"
             print(f"  {status} {table}")
         
         # Database statistics
@@ -308,17 +324,25 @@ class DuckDBMigration:
         print("Database Statistics")
         print("="*60)
         
-        # Get table sizes
-        tables = self.conn.execute("SHOW TABLES").fetchall()
+        # Get table sizes across all non-system schemas
+        tables = self.conn.execute(
+            """
+            SELECT table_schema, table_name
+            FROM information_schema.tables
+            WHERE table_schema NOT IN ('information_schema', 'pg_catalog')
+            ORDER BY table_schema, table_name
+            """
+        ).fetchall()
         total_rows = 0
         
-        for (table_name,) in tables:
+        for (schema_name, table_name) in tables:
             try:
-                row_count = self.conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+                full_name = f"{schema_name}.{table_name}"
+                row_count = self.conn.execute(f"SELECT COUNT(*) FROM {full_name}").fetchone()[0]
                 total_rows += row_count
-                print(f"  {table_name}: {row_count:,} rows")
+                print(f"  {full_name}: {row_count:,} rows")
             except:
-                # Handle schema.table format
+                # Keep summary resilient to partial/temporary failures.
                 pass
         
         print(f"\nTotal rows: {total_rows:,}")
@@ -329,7 +353,7 @@ class DuckDBMigration:
             print(f"Database size: {db_size_mb:.1f} MB")
         
         print("="*60)
-        print(f"✓ Migration complete! Database: {self.db_path}")
+        print(f"[OK] Migration complete! Database: {self.db_path}")
         print("="*60)
     
     def close(self):
@@ -360,3 +384,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
