@@ -329,6 +329,8 @@ estimated_annual_oop is computed from beneficiary-level prescription baskets (sy
 - deductible applicability (DED_APPLIES_YN / DEDUCTIBLE_APPLIES) with beneficiary-level deductible allocation
 - insulin copay rows from bronze.brz_insulin_cost with 30-day-equivalent cap proxy
 - uncovered/excluded formulary drug matches treated as full gross cost burden
+- when bronze.brz_pricing is available, UNIT_COST-based gross cost is calibrated before use:
+  winsorized by days-supply quantiles, bounded vs historical synthetic annual cost, then blended with the historical estimate
 
 ### Model Training & Outputs
 

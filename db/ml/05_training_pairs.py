@@ -27,6 +27,18 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from db.db_manager import get_db
 
 
+# Pricing calibration policy for UNIT_COST-driven annual gross estimates.
+# 1) winsorize UNIT_COST by days_supply_code
+# 2) bound pricing annual estimate relative to historical synthetic estimate
+# 3) blend bounded pricing estimate with historical synthetic estimate
+PRICING_WINSOR_LOW_Q = 0.01
+PRICING_WINSOR_HIGH_Q = 0.95
+PRICING_TO_HIST_RATIO_MIN = 0.50
+PRICING_TO_HIST_RATIO_MAX = 12.00
+PRICING_HIST_BLEND_WEIGHT = 0.35
+PRICING_ANNUAL_ABS_MAX = 25000.0
+
+
 def _table_exists(db, full_name):
     schema, table = full_name.split(".", 1)
     sql = """
@@ -83,11 +95,18 @@ def generate_training_pairs():
     print("   - Deductible + insulin handling")
     if has_pricing:
         print("   - Gross drug cost from bronze.brz_pricing (UNIT_COST x quantity)")
+        print(
+            "   - Calibration policy: "
+            f"winsor[{PRICING_WINSOR_LOW_Q:.2f},{PRICING_WINSOR_HIGH_Q:.2f}], "
+            f"ratio[{PRICING_TO_HIST_RATIO_MIN:.2f}x,{PRICING_TO_HIST_RATIO_MAX:.2f}x], "
+            f"blend_pricing={PRICING_HIST_BLEND_WEIGHT:.2f}, "
+            f"annual_abs_cap=${PRICING_ANNUAL_ABS_MAX:,.0f}"
+        )
     else:
         print("   - Gross drug cost fallback to synthetic estimated annual drug cost")
 
     if has_pricing:
-        pricing_cte_sql = """
+        pricing_cte_sql = f"""
         pricing_map_raw AS (
             SELECT
                 PLAN_KEY AS plan_key,
@@ -104,14 +123,32 @@ def generate_training_pairs():
             FROM bronze.brz_pricing
             WHERE PLAN_KEY IS NOT NULL AND NDC IS NOT NULL
         ),
+        pricing_unit_cost_bounds AS (
+            SELECT
+                days_supply_code,
+                quantile_cont(unit_cost, {PRICING_WINSOR_LOW_Q}) AS unit_cost_low,
+                quantile_cont(unit_cost, {PRICING_WINSOR_HIGH_Q}) AS unit_cost_high
+            FROM pricing_map_raw
+            GROUP BY days_supply_code
+        ),
         pricing_map AS (
             SELECT
-                plan_key,
-                ndc,
-                days_supply_code,
-                AVG(unit_cost) AS unit_cost
-            FROM pricing_map_raw
-            GROUP BY plan_key, ndc, days_supply_code
+                p.plan_key,
+                p.ndc,
+                p.days_supply_code,
+                AVG(
+                    LEAST(
+                        GREATEST(
+                            p.unit_cost,
+                            COALESCE(b.unit_cost_low, p.unit_cost)
+                        ),
+                        COALESCE(b.unit_cost_high, p.unit_cost)
+                    )
+                ) AS unit_cost
+            FROM pricing_map_raw p
+            LEFT JOIN pricing_unit_cost_bounds b
+              ON b.days_supply_code = p.days_supply_code
+            GROUP BY p.plan_key, p.ndc, p.days_supply_code
         ),
         pricing_map_any AS (
             SELECT
@@ -284,7 +321,7 @@ def generate_training_pairs():
             WHERE PLAN_KEY IS NOT NULL
             GROUP BY PLAN_KEY, tier, days_supply_code
         ),
-        pair_drug_base AS (
+        pair_drug_base_raw AS (
             SELECT
                 bp.bene_synth_id,
                 bp.plan_key,
@@ -296,18 +333,9 @@ def generate_training_pairs():
                 rx.days_supply_code,
                 rx.days_supply_months,
                 rx.fills_per_year,
-                COALESCE(pm_exact.unit_cost, pm_any.unit_cost) AS unit_cost,
-                CASE
-                    WHEN COALESCE(pm_exact.unit_cost, pm_any.unit_cost, 0.0) > 0
-                    THEN GREATEST(
-                        COALESCE(NULLIF(rx.qty_per_fill, 0.0), rx.assumed_units_per_fill),
-                        1.0
-                    ) * COALESCE(pm_exact.unit_cost, pm_any.unit_cost)
-                    ELSE GREATEST(
-                        rx.annual_gross_cost_fallback / NULLIF(rx.fills_per_year, 0.0),
-                        0.0
-                    )
-                END AS gross_per_fill,
+                GREATEST(COALESCE(NULLIF(rx.qty_per_fill, 0.0), rx.assumed_units_per_fill), 1.0) AS units_per_fill,
+                COALESCE(pm_exact.unit_cost, pm_any.unit_cost) AS unit_cost_resolved,
+                GREATEST(rx.annual_gross_cost_fallback, 0.0) AS annual_gross_cost_fallback,
                 CASE
                     WHEN COALESCE(pm_exact.unit_cost, pm_any.unit_cost, 0.0) > 0
                     THEN GREATEST(
@@ -316,8 +344,8 @@ def generate_training_pairs():
                         * COALESCE(pm_exact.unit_cost, pm_any.unit_cost),
                         0.0
                     )
-                    ELSE rx.annual_gross_cost_fallback
-                END AS annual_gross_cost,
+                    ELSE NULL
+                END AS annual_pricing_raw,
                 rx.is_insulin,
                 fm.formulary_tier,
                 COALESCE(rx.rxcui, fm.formulary_rxcui) AS effective_rxcui,
@@ -336,9 +364,55 @@ def generate_training_pairs():
               ON pm_any.plan_key = bp.plan_key
              AND pm_any.ndc = rx.ndc
         ),
+        pair_drug_base AS (
+            SELECT
+                pdr.bene_synth_id,
+                pdr.plan_key,
+                pdr.formulary_id,
+                pdr.plan_deductible,
+                pdr.ndc,
+                pdr.rxcui,
+                pdr.rx_tier,
+                pdr.days_supply_code,
+                pdr.days_supply_months,
+                pdr.fills_per_year,
+                pdr.is_insulin,
+                pdr.formulary_tier,
+                pdr.effective_rxcui,
+                pdr.in_formulary,
+                CASE
+                    WHEN pdr.annual_pricing_raw IS NULL THEN pdr.annual_gross_cost_fallback
+                    ELSE GREATEST(
+                        (
+                            {PRICING_HIST_BLEND_WEIGHT}
+                            * CASE
+                                WHEN pdr.annual_gross_cost_fallback > 0 THEN LEAST(
+                                    GREATEST(
+                                        pdr.annual_pricing_raw,
+                                        pdr.annual_gross_cost_fallback * {PRICING_TO_HIST_RATIO_MIN}
+                                    ),
+                                    pdr.annual_gross_cost_fallback * {PRICING_TO_HIST_RATIO_MAX},
+                                    {PRICING_ANNUAL_ABS_MAX}
+                                )
+                                ELSE LEAST(pdr.annual_pricing_raw, {PRICING_ANNUAL_ABS_MAX})
+                            END
+                        ) + (
+                            (1.0 - {PRICING_HIST_BLEND_WEIGHT})
+                            * pdr.annual_gross_cost_fallback
+                        ),
+                        0.0
+                    )
+                END AS annual_gross_cost
+            FROM pair_drug_base_raw pdr
+        ),
         pair_drug_status AS (
             SELECT
                 pdb.*,
+                CASE
+                    WHEN pdb.fills_per_year > 0
+                    THEN GREATEST(pdb.annual_gross_cost / pdb.fills_per_year, 0.0)
+                    ELSE 0.0
+                END AS gross_per_fill,
                 COALESCE(pdb.formulary_tier, pdb.rx_tier, 1) AS effective_tier,
                 CASE WHEN ex.rxcui IS NOT NULL THEN 1 ELSE 0 END AS is_excluded,
                 CASE
@@ -572,10 +646,17 @@ def generate_training_pairs():
             COUNT(DISTINCT bene_synth_id) AS unique_benes,
             COUNT(DISTINCT plan_key) AS unique_plans,
             ROUND(AVG(estimated_annual_oop), 2) AS avg_oop,
+            ROUND(quantile_cont(estimated_annual_oop, 0.50), 2) AS p50_oop,
+            ROUND(quantile_cont(estimated_annual_oop, 0.90), 2) AS p90_oop,
+            ROUND(quantile_cont(estimated_annual_oop, 0.99), 2) AS p99_oop,
             ROUND(AVG(oop_copay_component), 2) AS avg_oop_copay,
             ROUND(AVG(oop_coinsurance_component), 2) AS avg_oop_coins,
             ROUND(AVG(oop_deductible_component), 2) AS avg_oop_deductible,
             ROUND(AVG(oop_uncovered_component), 2) AS avg_oop_uncovered,
+            ROUND(
+                100.0 * SUM(CASE WHEN estimated_annual_oop > 20000 THEN 1 ELSE 0 END) / COUNT(*),
+                2
+            ) AS pct_oop_gt_20k,
             ROUND(AVG(distance_miles), 2) AS avg_distance,
             SUM(CASE WHEN has_distance_tradeoff THEN 1 ELSE 0 END) AS tradeoff_pairs,
             ROUND(100.0 * SUM(CASE WHEN has_distance_tradeoff THEN 1 ELSE 0 END) / COUNT(*), 2) AS tradeoff_pct
@@ -592,10 +673,15 @@ def generate_training_pairs():
     print(f"  - Avg plans per beneficiary: {pairs_per_bene:.1f}")
     print("\n  Cost objective components:")
     print(f"  - Avg estimated OOP: ${stats['avg_oop'][0]:,.2f}")
+    print(
+        "  - OOP quantiles (p50/p90/p99): "
+        f"${stats['p50_oop'][0]:,.2f} / ${stats['p90_oop'][0]:,.2f} / ${stats['p99_oop'][0]:,.2f}"
+    )
     print(f"  - Avg OOP copay component: ${stats['avg_oop_copay'][0]:,.2f}")
     print(f"  - Avg OOP coinsurance component: ${stats['avg_oop_coins'][0]:,.2f}")
     print(f"  - Avg OOP deductible component: ${stats['avg_oop_deductible'][0]:,.2f}")
     print(f"  - Avg OOP uncovered component: ${stats['avg_oop_uncovered'][0]:,.2f}")
+    print(f"  - Share OOP > $20k: {stats['pct_oop_gt_20k'][0]}%")
     print(f"  - Avg distance: {stats['avg_distance'][0]} miles")
     print(f"  - Pairs with tradeoff: {stats['tradeoff_pairs'][0]:,} ({stats['tradeoff_pct'][0]}%)")
 

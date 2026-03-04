@@ -29,6 +29,7 @@ import pickle
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from db.db_manager import get_db
+from utils.drug_input import normalize_ndc_token, summarize_medication_rows
 
 # ===== Page Configuration =====
 st.set_page_config(
@@ -550,51 +551,105 @@ def get_plans_for_location(state, county_code):
 @st.cache_data(ttl=1800)
 def search_drug_catalog(query_text, limit=20):
     """
-    Search beneficiary-level synthetic prescriptions by drug name.
+    Search beneficiary-level synthetic prescriptions by drug name or NDC.
+
+    Returns aggregated default attributes for UI prefill.
     """
-    query_text = str(query_text or "").strip().lower()
-    if len(query_text) < 2:
-        return pd.DataFrame(columns=["drug_name", "ndc"])
+    query_text_raw = str(query_text or "").strip()
+    query_text = query_text_raw.lower()
+    ndc_digits = "".join(ch for ch in query_text_raw if ch.isdigit())
+    if len(query_text) < 2 and len(ndc_digits) < 4:
+        return pd.DataFrame(columns=[
+            "drug_name",
+            "ndc",
+            "tier_level",
+            "days_supply_mode",
+            "fills_per_year",
+            "is_insulin",
+            "annual_cost_est",
+        ])
 
     db = get_database()
     like_value = f"%{query_text}%"
+    like_ndc = f"%{ndc_digits}%" if len(ndc_digits) >= 4 else "__NO_MATCH__"
     try:
         sql = """
-            SELECT DISTINCT
+            WITH matched AS (
+                SELECT
+                    CAST(
+                        COALESCE(
+                            NULLIF(drug_name, ''),
+                            NULLIF(drug_synonym, ''),
+                            CONCAT('NDC ', ndc)
+                        ) AS VARCHAR
+                    ) AS drug_name,
+                    CAST(ndc AS VARCHAR) AS ndc,
+                    TRY_CAST(tier_level AS INTEGER) AS tier_level,
+                    TRY_CAST(days_supply_mode AS INTEGER) AS days_supply_mode,
+                    TRY_CAST(fills_per_year AS DOUBLE) AS fills_per_year,
+                    TRY_CAST(is_insulin AS INTEGER) AS is_insulin,
+                    TRY_CAST(estimated_annual_drug_cost AS DOUBLE) AS annual_cost_est
+                FROM synthetic.syn_beneficiary_prescriptions
+                WHERE (
+                        LOWER(COALESCE(drug_name, '')) LIKE ?
+                        OR LOWER(COALESCE(drug_synonym, '')) LIKE ?
+                        OR CAST(ndc AS VARCHAR) LIKE ?
+                      )
+                  AND ndc IS NOT NULL
+            )
+            SELECT
+                CAST(drug_name AS VARCHAR) AS drug_name,
+                CAST(ndc AS VARCHAR) AS ndc,
+                CAST(COALESCE(MIN(tier_level), 1) AS INTEGER) AS tier_level,
                 CAST(
-                    COALESCE(
-                        NULLIF(drug_name, ''),
-                        NULLIF(drug_synonym, ''),
-                        CONCAT('NDC ', ndc)
-                    ) AS VARCHAR
-                ) AS drug_name,
-                CAST(ndc AS VARCHAR) AS ndc
-            FROM synthetic.syn_beneficiary_prescriptions
-            WHERE (
-                    LOWER(COALESCE(drug_name, '')) LIKE ?
-                    OR LOWER(COALESCE(drug_synonym, '')) LIKE ?
-                  )
-              AND ndc IS NOT NULL
+                    CASE
+                        WHEN COALESCE(ROUND(AVG(days_supply_mode)), 30) >= 75 THEN 90
+                        WHEN COALESCE(ROUND(AVG(days_supply_mode)), 30) >= 45 THEN 60
+                        ELSE 30
+                    END AS INTEGER
+                ) AS days_supply_mode,
+                CAST(COALESCE(ROUND(AVG(fills_per_year), 1), 12.0) AS DOUBLE) AS fills_per_year,
+                CAST(COALESCE(MAX(is_insulin), 0) AS INTEGER) AS is_insulin,
+                CAST(COALESCE(ROUND(AVG(annual_cost_est), 2), 0.0) AS DOUBLE) AS annual_cost_est
+            FROM matched
+            GROUP BY drug_name, ndc
             ORDER BY drug_name, ndc
             LIMIT ?
         """
-        return db.query_df(sql, [like_value, like_value, int(limit)])
+        return db.query_df(sql, [like_value, like_value, like_ndc, int(limit)])
     except Exception:
-        # Fallback for older table versions that may not include drug_synonym.
+        # Fallback for older table versions with fewer columns.
         try:
             fallback_sql = """
-                SELECT DISTINCT
+                SELECT
                     CAST(COALESCE(NULLIF(drug_name, ''), CONCAT('NDC ', ndc)) AS VARCHAR) AS drug_name,
-                    CAST(ndc AS VARCHAR) AS ndc
+                    CAST(ndc AS VARCHAR) AS ndc,
+                    CAST(1 AS INTEGER) AS tier_level,
+                    CAST(30 AS INTEGER) AS days_supply_mode,
+                    CAST(12.0 AS DOUBLE) AS fills_per_year,
+                    CAST(0 AS INTEGER) AS is_insulin,
+                    CAST(0.0 AS DOUBLE) AS annual_cost_est
                 FROM synthetic.syn_beneficiary_prescriptions
-                WHERE LOWER(COALESCE(drug_name, '')) LIKE ?
+                WHERE (
+                        LOWER(COALESCE(drug_name, '')) LIKE ?
+                        OR CAST(ndc AS VARCHAR) LIKE ?
+                      )
                   AND ndc IS NOT NULL
+                GROUP BY 1, 2
                 ORDER BY drug_name, ndc
                 LIMIT ?
             """
-            return db.query_df(fallback_sql, [like_value, int(limit)])
+            return db.query_df(fallback_sql, [like_value, like_ndc, int(limit)])
         except Exception:
-            return pd.DataFrame(columns=["drug_name", "ndc"])
+            return pd.DataFrame(columns=[
+                "drug_name",
+                "ndc",
+                "tier_level",
+                "days_supply_mode",
+                "fills_per_year",
+                "is_insulin",
+                "annual_cost_est",
+            ])
 
 
 @st.cache_data(ttl=1800)
@@ -1279,38 +1334,177 @@ def main():
     
     # Medications
     st.sidebar.subheader("Medications")
-    num_drugs = st.sidebar.number_input("Number of medications", min_value=1, max_value=20, value=3)
-    avg_fills_per_year = st.sidebar.number_input("Average fills per year", min_value=1, max_value=100, value=12)
-    is_insulin_user = st.sidebar.checkbox("Insulin user")
-    st.sidebar.caption("Optional: filter plans by requested drug names.")
 
-    enable_drug_filter = st.sidebar.checkbox(
-        "Filter plans by requested drugs",
-        value=False,
-        help="When enabled, plans are evaluated against selected medications."
-    )
+    if "selected_medication_rows" not in st.session_state:
+        st.session_state["selected_medication_rows"] = []
+
     drug_name_query = st.sidebar.text_input(
-        "Search medication name",
+        "Search drug by name or NDC",
         value="",
-        placeholder="Type at least 2 characters",
-        disabled=not enable_drug_filter
+        placeholder="e.g., metformin or 00002871501",
     )
-    drug_lookup = search_drug_catalog(drug_name_query, limit=25) if enable_drug_filter else pd.DataFrame()
-    drug_lookup_options = []
-    option_to_ndc = {}
+    drug_lookup = search_drug_catalog(drug_name_query, limit=30)
+    lookup_option_labels = ["Select a drug..."]
+    lookup_option_map = {}
     if len(drug_lookup) > 0:
         for _, row in drug_lookup.iterrows():
-            option_label = f"{row['drug_name']} [NDC {row['ndc']}]"
-            if option_label not in option_to_ndc:
-                option_to_ndc[option_label] = str(row["ndc"])
-                drug_lookup_options.append(option_label)
-    selected_drug_options = st.sidebar.multiselect(
-        "Select medications",
-        options=drug_lookup_options,
-        default=[],
-        disabled=(not enable_drug_filter or len(drug_lookup_options) == 0)
+            label = (
+                f"{row['drug_name']} [NDC {row['ndc']}] "
+                f"(tier {int(row.get('tier_level', 1))}, {int(row.get('days_supply_mode', 30))}d)"
+            )
+            if label not in lookup_option_map:
+                lookup_option_map[label] = row.to_dict()
+                lookup_option_labels.append(label)
+
+    selected_lookup_label = st.sidebar.selectbox(
+        "Search results",
+        options=lookup_option_labels,
+        index=0,
     )
-    selected_drug_ndcs = [option_to_ndc[o] for o in selected_drug_options if o in option_to_ndc]
+
+    manual_ndc = st.sidebar.text_input(
+        "Or add NDC directly",
+        value="",
+        placeholder="11-digit NDC",
+    )
+    manual_ndc_values = normalize_ndc_token(manual_ndc)
+
+    add_col1, add_col2 = st.sidebar.columns(2)
+    add_selected = add_col1.button(
+        "Add drug",
+        use_container_width=True,
+        disabled=selected_lookup_label == "Select a drug...",
+    )
+    add_manual = add_col2.button(
+        "Add NDC",
+        use_container_width=True,
+        disabled=len(manual_ndc_values) == 0,
+    )
+
+    if add_selected and selected_lookup_label in lookup_option_map:
+        selected_row = lookup_option_map[selected_lookup_label]
+        selected_days_supply = pd.to_numeric(selected_row.get("days_supply_mode"), errors="coerce")
+        selected_tier = pd.to_numeric(selected_row.get("tier_level"), errors="coerce")
+        selected_fills = pd.to_numeric(selected_row.get("fills_per_year"), errors="coerce")
+        selected_insulin = pd.to_numeric(selected_row.get("is_insulin"), errors="coerce")
+        selected_annual_cost = pd.to_numeric(selected_row.get("annual_cost_est"), errors="coerce")
+        days_supply_mode = int(selected_days_supply) if pd.notna(selected_days_supply) else 30
+        if days_supply_mode not in (30, 60, 90):
+            days_supply_mode = 30 if days_supply_mode < 45 else (60 if days_supply_mode < 75 else 90)
+        tier_level = int(selected_tier) if pd.notna(selected_tier) else 1
+        tier_level = min(7, max(1, tier_level))
+        fills_per_year = float(selected_fills) if pd.notna(selected_fills) else 12.0
+        fills_per_year = max(1.0, fills_per_year)
+        annual_cost_est = float(selected_annual_cost) if pd.notna(selected_annual_cost) else 0.0
+        annual_cost_est = max(0.0, annual_cost_est)
+        new_row = {
+            "drug_name": str(selected_row.get("drug_name", "") or f"NDC {selected_row.get('ndc', '')}"),
+            "ndc": str(selected_row.get("ndc", "")),
+            "days_supply_mode": days_supply_mode,
+            "tier_level": tier_level,
+            "fills_per_year": fills_per_year,
+            "is_insulin": bool(int(selected_insulin)) if pd.notna(selected_insulin) else False,
+            "annual_cost_est": annual_cost_est,
+        }
+        existing_ndcs = {str(r.get("ndc", "")) for r in st.session_state["selected_medication_rows"]}
+        if new_row["ndc"] not in existing_ndcs:
+            st.session_state["selected_medication_rows"].append(new_row)
+            st.sidebar.success(f"Added {new_row['drug_name']} ({new_row['ndc']})")
+        else:
+            st.sidebar.info(f"NDC {new_row['ndc']} is already in the medication list.")
+
+    if add_manual and len(manual_ndc_values) > 0:
+        ndc_value = manual_ndc_values[-1]
+        existing_ndcs = {str(r.get("ndc", "")) for r in st.session_state["selected_medication_rows"]}
+        if ndc_value not in existing_ndcs:
+            st.session_state["selected_medication_rows"].append(
+                {
+                    "drug_name": f"NDC {ndc_value}",
+                    "ndc": ndc_value,
+                    "days_supply_mode": 30,
+                    "tier_level": 1,
+                    "fills_per_year": 12.0,
+                    "is_insulin": False,
+                    "annual_cost_est": 0.0,
+                }
+            )
+            st.sidebar.success(f"Added NDC {ndc_value}")
+        else:
+            st.sidebar.info(f"NDC {ndc_value} is already in the medication list.")
+
+    if st.sidebar.button("Clear medication list", use_container_width=True):
+        st.session_state["selected_medication_rows"] = []
+        st.sidebar.info("Medication list cleared.")
+
+    medication_rows = st.session_state.get("selected_medication_rows", [])
+    if len(medication_rows) > 0:
+        med_df = pd.DataFrame(medication_rows)
+        edited_med_df = st.sidebar.data_editor(
+            med_df,
+            hide_index=True,
+            num_rows="dynamic",
+            use_container_width=True,
+            key="selected_medication_editor",
+            column_config={
+                "drug_name": st.column_config.TextColumn("Drug name", disabled=True),
+                "ndc": st.column_config.TextColumn("NDC", disabled=True),
+                "days_supply_mode": st.column_config.SelectboxColumn(
+                    "Days supply",
+                    options=[30, 60, 90],
+                    required=True,
+                ),
+                "tier_level": st.column_config.SelectboxColumn(
+                    "Tier",
+                    options=[1, 2, 3, 4, 5, 6, 7],
+                    required=True,
+                ),
+                "fills_per_year": st.column_config.NumberColumn(
+                    "Fills/year",
+                    min_value=1.0,
+                    max_value=100.0,
+                    step=1.0,
+                ),
+                "is_insulin": st.column_config.CheckboxColumn("Insulin"),
+                "annual_cost_est": st.column_config.NumberColumn(
+                    "Annual cost est ($)",
+                    min_value=0.0,
+                    max_value=100000.0,
+                    step=50.0,
+                ),
+            },
+        )
+        medication_rows = edited_med_df.to_dict("records")
+
+    medication_summary = summarize_medication_rows(medication_rows)
+    st.session_state["selected_medication_rows"] = medication_summary["rows"]
+
+    if medication_summary["num_drugs"] > 0:
+        st.sidebar.caption("Unique medications and average fills are derived from the medication list.")
+        stats_col1, stats_col2 = st.sidebar.columns(2)
+        stats_col1.metric("Unique drugs", int(medication_summary["num_drugs"]))
+        stats_col2.metric("Avg fills/year", f"{medication_summary['avg_fills_per_year']:.1f}")
+        num_drugs = int(medication_summary["num_drugs"])
+        avg_fills_per_year = float(medication_summary["avg_fills_per_year"])
+    else:
+        st.sidebar.caption("No medication rows selected. Enter profile-level medication values manually.")
+        num_drugs = st.sidebar.number_input("Number of medications", min_value=1, max_value=20, value=3)
+        avg_fills_per_year = st.sidebar.number_input("Average fills per year", min_value=1, max_value=100, value=12)
+
+    is_insulin_user = st.sidebar.checkbox(
+        "Insulin user",
+        value=bool(medication_summary["is_insulin_user"]),
+        help="Defaults from selected medications; you can override manually.",
+    )
+    if medication_summary["is_insulin_user"] == 1 and not is_insulin_user:
+        st.sidebar.caption("Insulin flag was auto-detected from selected medications and has been manually overridden.")
+
+    st.sidebar.caption("Use selected medications for plan-level coverage filtering.")
+    enable_drug_filter = st.sidebar.checkbox(
+        "Filter plans by selected medications",
+        value=bool(medication_summary["num_drugs"] > 0),
+        disabled=medication_summary["num_drugs"] == 0,
+        help="When enabled, plans are filtered by coverage of selected NDCs."
+    )
     min_drug_coverage_pct = st.sidebar.slider(
         "Minimum requested-drug coverage (%)",
         min_value=0,
@@ -1325,13 +1519,23 @@ def main():
     
     # Cost estimate
     st.sidebar.subheader("Cost Information")
-    total_rx_cost_est = st.sidebar.number_input(
-        "Estimated annual drug cost ($)", 
-        min_value=100.0, 
-        max_value=50000.0, 
-        value=2000.0,
-        step=100.0
+    derived_total_rx_cost = float(medication_summary["total_annual_drug_cost"])
+    use_derived_rx_cost = st.sidebar.checkbox(
+        "Auto-calculate annual drug cost from medication list",
+        value=bool(derived_total_rx_cost > 0),
+        disabled=derived_total_rx_cost <= 0,
     )
+    if use_derived_rx_cost and derived_total_rx_cost > 0:
+        total_rx_cost_est = float(derived_total_rx_cost)
+        st.sidebar.info(f"Estimated annual drug cost (derived): ${total_rx_cost_est:,.2f}")
+    else:
+        total_rx_cost_est = st.sidebar.number_input(
+            "Estimated annual drug cost ($)",
+            min_value=100.0,
+            max_value=50000.0,
+            value=2000.0,
+            step=100.0
+        )
     
     st.sidebar.markdown("---")
     
@@ -1406,14 +1610,11 @@ def main():
     
     # ===== Main Content Area =====
     if get_recommendations:
-        requested_ndcs = tuple(dict.fromkeys(selected_drug_ndcs))
-        requested_name_map = {
-            option_to_ndc[o]: o.split(" [NDC ", 1)[0]
-            for o in selected_drug_options
-            if o in option_to_ndc
-        }
+        requested_ndcs = tuple(medication_summary["requested_ndcs"])
+        requested_name_map = dict(medication_summary["requested_name_map"])
         if enable_drug_filter and len(requested_ndcs) > 0:
-            num_drugs = max(int(num_drugs), len(requested_ndcs))
+            num_drugs = max(int(num_drugs), int(medication_summary["num_drugs"]))
+            avg_fills_per_year = max(float(avg_fills_per_year), float(medication_summary["avg_fills_per_year"]))
 
         # Get state and county codes for querying
         state_code, county_code = get_state_county_codes(state_name, county_name)

@@ -165,3 +165,31 @@ python -m db.run_full_pipeline
 4. **Geographic Features**: Distance-based recommendations with tradeoff analysis
 5. **Explainability**: Human-readable warnings and cost breakdowns
 6. **Maintainability**: Clear medallion architecture and well-documented code
+
+## 2026-03 Update: Pricing + Calibration + Lineage
+
+### A. Pricing Ingestion Reinforced
+- `scripts/migrate_to_duckdb.py` now ingests `data/SPUF/pricing.parquet` into `bronze.brz_pricing`
+- Added pricing indexes for `PLAN_KEY`, `NDC`, `DAYS_SUPPLY_CODE`, and composite lookup
+
+### B. Training Cost Calibration Policy
+- `db/ml/05_training_pairs.py` now applies explicit calibration before OOP aggregation when pricing is available:
+  - winsorization of `UNIT_COST` by days supply
+  - bounded ratio vs historical synthetic annual cost
+  - bounded blend with historical synthetic annual cost
+- This prevents extreme right-tail OOP inflation from raw pricing outliers
+
+### C. Beneficiary Table Lineage
+- Active beneficiary tables:
+  - `synthetic.syn_beneficiary`
+  - `synthetic.syn_beneficiary_prescriptions`
+- Legacy `synthetic.beneficiary_profiles` is treated as non-pipeline legacy data
+
+### D. Practical Validation Pattern
+- Rebuild sequence after pricing/cost logic changes:
+  1. `python scripts/migrate_to_duckdb.py`
+  2. `python db/ml/05_training_pairs.py`
+  3. `python db/ml/06_recommendation_explainer.py`
+- Validate with:
+  - OOP quantiles (`p50/p90/p99`) and tail share (`% > 20k`)
+  - ranking pipeline regression tests

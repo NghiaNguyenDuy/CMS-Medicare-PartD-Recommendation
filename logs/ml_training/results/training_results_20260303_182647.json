@@ -1,0 +1,74 @@
+{
+  "timestamp": "20260303_182647",
+  "log_file": "logs\\ml_training\\training_20260303_182522.log",
+  "training_stats": {
+    "best_iteration": 500,
+    "train_ndcg@3": 0.9837246048502055,
+    "test_ndcg@3": 0.9674840062588913,
+    "train_ndcg@5": 0.9855481151459116,
+    "test_ndcg@5": 0.9725829537234894
+  },
+  "feature_importance": [
+    {
+      "feature": "cost_per_drug",
+      "importance": 336225.15807294846
+    },
+    {
+      "feature": "premium",
+      "importance": 132876.0668669939
+    },
+    {
+      "feature": "distance_miles",
+      "importance": 97177.84567022324
+    },
+    {
+      "feature": "total_drug_oop",
+      "importance": 77064.82866442204
+    },
+    {
+      "feature": "annual_premium",
+      "importance": 42585.64479792118
+    },
+    {
+      "feature": "deductible",
+      "importance": 36979.71424245834
+    },
+    {
+      "feature": "formulary_st_rate",
+      "importance": 29975.429548978806
+    },
+    {
+      "feature": "avg_fills_per_year",
+      "importance": 22118.52653825283
+    },
+    {
+      "feature": "premium_to_oop_ratio",
+      "importance": 20535.717999100685
+    },
+    {
+      "feature": "formulary_generic_pct",
+      "importance": 10807.737812519073
+    },
+    {
+      "feature": "formulary_specialty_pct",
+      "importance": 10381.116983532906
+    },
+    {
+      "feature": "num_drugs",
+      "importance": 8860.548910617828
+    },
+    {
+      "feature": "formulary_pa_rate",
+      "importance": 6793.427859783173
+    },
+    {
+      "feature": "formulary_ql_rate",
+      "importance": 6613.155619740486
+    },
+    {
+      "feature": "has_distance_tradeoff",
+      "importance": 2953.5429198741913
+    }
+  ],
+  "model_path": "models/plan_ranker.pkl"
+}

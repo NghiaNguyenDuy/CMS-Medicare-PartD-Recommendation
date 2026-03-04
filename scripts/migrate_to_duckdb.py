@@ -273,17 +273,17 @@ class DuckDBMigration:
             )
 
         # 9. Pharmacy Networks (needs PLAN_KEY)
-        if (self.parquet_dir / 'pharmacy_network.parquet').exists():
-            results['bronze.brz_pharmacy_network'] = self.migrate_table(
-                table_name='bronze.brz_pharmacy_network',
-                parquet_file='pharmacy_network.parquet',
-                transform_fn=add_plan_key_with_segment,
-                index_sqls=[
-                    "CREATE INDEX idx_pharm_plan ON bronze.brz_pharmacy_network(PLAN_KEY)",
-                    "CREATE INDEX idx_pharm_id ON bronze.brz_pharmacy_network(PHARMACY_NUMBER)",
-                    "CREATE INDEX idx_pharm_zip ON bronze.brz_pharmacy_network(PHARMACY_ZIPCODE)"
-                ]
-            )
+        # if (self.parquet_dir / 'pharmacy_network.parquet').exists():
+        #     results['bronze.brz_pharmacy_network'] = self.migrate_table(
+        #         table_name='bronze.brz_pharmacy_network',
+        #         parquet_file='pharmacy_network.parquet',
+        #         transform_fn=add_plan_key_with_segment,
+        #         index_sqls=[
+        #             "CREATE INDEX idx_pharm_plan ON bronze.brz_pharmacy_network(PLAN_KEY)",
+        #             "CREATE INDEX idx_pharm_id ON bronze.brz_pharmacy_network(PHARMACY_NUMBER)",
+        #             "CREATE INDEX idx_pharm_zip ON bronze.brz_pharmacy_network(PHARMACY_ZIPCODE)"
+        #         ]
+        #     )
         
         # # 9. Beneficiary Profiles (synthetic data)
         # beneficiary_path = Path('data/synthetic/beneficiary_profiles.csv')

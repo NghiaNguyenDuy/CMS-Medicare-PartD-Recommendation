@@ -19,13 +19,47 @@ description: Work on this Medicare Part D recommendation codebase that uses Duck
   - `IS_MA_PD -> 'MA'`
   - `IS_PDP -> 'PDP'`
 - Treat `data/medicare_part_d.duckdb` as the canonical database file.
+- App and inference flows should be read-only against DuckDB.
+
+## Current Data Contracts (Important)
+
+- Use `synthetic.syn_beneficiary` and `synthetic.syn_beneficiary_prescriptions` for beneficiary logic.
+- Do not use `synthetic.beneficiary_profiles` in new pipeline code.
+- Use drug name fields from `synthetic.syn_beneficiary_prescriptions`:
+  - `drug_name`, `drug_synonym`, `drug_tty`, `drug_name_source`
+- `bronze.brz_pricing` is required for UNIT_COST-based cost estimation.
+- Validate these tables from `data/meta_db.csv` before SQL edits.
+
+## Cost Objective Policy (Current)
+
+`ml.training_plan_pairs` uses a calibrated annual cost objective before ranking:
+
+- Base objective:
+  - `ranking_cost_objective = (plan_premium * 12) + estimated_annual_oop + distance_penalty`
+- OOP logic:
+  - SPUF preferred-retail cost rules from `bronze.brz_beneficiary_cost`
+  - deductible applicability from `DED_APPLIES_YN` / `DEDUCTIBLE_APPLIES`
+  - insulin handling from `bronze.brz_insulin_cost`
+  - uncovered/excluded burden from formulary + excluded tables
+- Pricing calibration policy (when `bronze.brz_pricing` exists):
+  - winsorize `UNIT_COST` by `days_supply_code` quantiles
+  - bound pricing annual estimate to historical synthetic annual estimate ratio
+  - blend bounded pricing estimate with historical estimate
+
+Current calibration constants in `db/ml/05_training_pairs.py`:
+- `PRICING_WINSOR_LOW_Q = 0.01`
+- `PRICING_WINSOR_HIGH_Q = 0.95`
+- `PRICING_TO_HIST_RATIO_MIN = 0.50`
+- `PRICING_TO_HIST_RATIO_MAX = 12.00`
+- `PRICING_HIST_BLEND_WEIGHT = 0.35`
+- `PRICING_ANNUAL_ABS_MAX = 25000.0`
 
 ## Pipeline Execution
 
 Run in this order unless the task needs only a subset:
 
 ```bash
-python scripts/migrate_to_duckdb.py --force
+python scripts/migrate_to_duckdb.py
 python db/bronze/06_ingest_insulin_ref.py
 python db/bronze/05_ingest_geography.py
 python db/gold/03_dim_zipcode.py
@@ -41,6 +75,14 @@ python db/ml/06_recommendation_explainer.py
 ```
 
 Use `python db/utils/validate_schema.py` after major pipeline changes.
+
+Minimum rebuild after pricing/cost changes:
+
+```bash
+python scripts/migrate_to_duckdb.py
+python db/ml/05_training_pairs.py
+python db/ml/06_recommendation_explainer.py
+```
 
 ## Model and App Workflow
 
@@ -64,6 +106,7 @@ Use the quick checks in `references/sql_checks.md`.
 - Wrong join key case (`PLAN_KEY` vs `plan_key`) silently drops rows.
 - `contract_type` is usually derived logic, not a raw bronze column.
 - Distance features depend on both `gold.agg_plan_network_metrics` and geography.
+- If `estimated_annual_oop` tail explodes (very high p99), inspect pricing calibration and `UNIT_COST` quantiles before retraining.
 
 ## Output Expectations
 
