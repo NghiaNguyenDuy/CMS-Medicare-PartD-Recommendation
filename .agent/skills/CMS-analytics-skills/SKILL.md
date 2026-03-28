@@ -1,6 +1,6 @@
 ---
 name: cms-medicare-part-d-duckdb
-description: Work on this Medicare Part D recommendation codebase that uses DuckDB medallion layers, LightGBM ranking, and a Streamlit app. Use when tasks involve running or debugging the pipeline, validating table/column names from data/meta_db.csv, writing SQL across bronze/gold/ml/synthetic schemas, updating model training in ml_model/train_model_from_db.py, or modifying app/streamlit_app_interactive.py.
+description: Work on this Medicare Part D recommendation codebase that uses DuckDB medallion layers, synthetic beneficiary generation, LightGBM ranking, and a Streamlit app. Use when tasks involve the bronze/gold/ml/synthetic schemas, pipeline execution, DuckDB SQL validation, model training in ml_model/train_model_from_db.py, or real-time recommendation logic in app/streamlit_app_interactive.py.
 ---
 
 # CMS Medicare Part D DuckDB Skill
@@ -8,17 +8,18 @@ description: Work on this Medicare Part D recommendation codebase that uses Duck
 ## Start Here
 
 1. Read `README.md` for architecture and pipeline order.
-2. Treat `data/meta_db.csv` as the schema source of truth before writing SQL.
+2. Treat the live DuckDB schema as the source of truth before writing SQL.
 3. Load only task-relevant files. Do not preload entire `db/`.
 
 ## Working Defaults
 
 - Prefer running from repo root.
+- Canonical database file: `data/medicare_part_d.duckdb`
+- Shared DB entrypoint: `db/db_manager.py`
 - Prefer `PLAN_KEY` for plan joins unless a table explicitly exposes `plan_key`.
 - Derive contract type from `bronze.brz_plan_info` flags:
   - `IS_MA_PD -> 'MA'`
   - `IS_PDP -> 'PDP'`
-- Treat `data/medicare_part_d.duckdb` as the canonical database file.
 - App and inference flows should be read-only against DuckDB.
 
 ## Current Data Contracts (Important)
@@ -28,7 +29,7 @@ description: Work on this Medicare Part D recommendation codebase that uses Duck
 - Use drug name fields from `synthetic.syn_beneficiary_prescriptions`:
   - `drug_name`, `drug_synonym`, `drug_tty`, `drug_name_source`
 - `bronze.brz_pricing` is required for UNIT_COST-based cost estimation.
-- Validate these tables from `data/meta_db.csv` before SQL edits.
+- Validate table/column names from DuckDB with `DESCRIBE`, `information_schema`, or the checks in `references/sql_checks.md`.
 
 ## Cost Objective Policy (Current)
 
@@ -59,19 +60,11 @@ Current calibration constants in `db/ml/05_training_pairs.py`:
 Run in this order unless the task needs only a subset:
 
 ```bash
-python scripts/migrate_to_duckdb.py
+python scripts/migrate_to_duckdb.py --force
 python db/bronze/06_ingest_insulin_ref.py
 python db/bronze/05_ingest_geography.py
-python db/gold/03_dim_zipcode.py
-python db/gold/05_agg_formulary.py
-python db/gold/07_agg_networks.py
-python db/gold/06_agg_cost.py
-python db/gold/08_affordability_index_pca.py
 python scripts/generate_beneficiary_profiles.py
-python db/ml/02_assign_geography.py
-python db/ml/03_calculate_distance.py
-python db/ml/05_training_pairs.py
-python db/ml/06_recommendation_explainer.py
+python -m db.run_full_pipeline --layers gold ml
 ```
 
 Use `python db/utils/validate_schema.py` after major pipeline changes.
@@ -79,9 +72,9 @@ Use `python db/utils/validate_schema.py` after major pipeline changes.
 Minimum rebuild after pricing/cost changes:
 
 ```bash
-python scripts/migrate_to_duckdb.py
-python db/ml/05_training_pairs.py
-python db/ml/06_recommendation_explainer.py
+python scripts/migrate_to_duckdb.py --force
+python scripts/generate_beneficiary_profiles.py
+python -m db.run_full_pipeline --layers gold ml
 ```
 
 ## Model and App Workflow
@@ -89,14 +82,24 @@ python db/ml/06_recommendation_explainer.py
 - Train model: `python ml_model/train_model_from_db.py`
 - Run app: `streamlit run app/streamlit_app_interactive.py`
 - If model file is missing, regenerate `models/plan_ranker.pkl` before app debugging.
+- App inference entrypoint: `app/streamlit_app_interactive.py`
+- Primary click path for recommendations:
+  1. sidebar input + medication normalization via `utils/drug_input.py`
+  2. resolve county/state codes from `gold.dim_zipcode`
+  3. load candidate plans from `bronze.brz_plan_info` + gold metrics
+  4. optional nearby-county fallback if no local plans
+  5. optional requested-drug coverage check from formulary + excluded tables
+  6. pharmacy distance and access metrics from `bronze.brz_pharmacy_network`
+  7. `rank_plans(...)` computes OOP, distance penalty, model features, and final decision score
 
 ## Schema-First Debugging
 
 Before changing SQL:
 
-1. Confirm table and columns in `data/meta_db.csv`.
+1. Confirm the table exists in DuckDB.
 2. Confirm key type/case (`PLAN_KEY` vs `plan_key`, string vs numeric county code).
 3. Confirm schema names (`bronze`, `gold`, `ml`, `synthetic`).
+4. Confirm whether the app uses the field at training time, inference time, or both.
 
 Use the quick checks in `references/sql_checks.md`.
 
@@ -106,6 +109,8 @@ Use the quick checks in `references/sql_checks.md`.
 - Wrong join key case (`PLAN_KEY` vs `plan_key`) silently drops rows.
 - `contract_type` is usually derived logic, not a raw bronze column.
 - Distance features depend on both `gold.agg_plan_network_metrics` and geography.
+- App ranking now uses pharmacy-level distance when ZIP is available, not only the precomputed ML distance proxy.
+- Requested-drug coverage in the app depends on `bronze.brz_basic_formulary` plus `bronze.brz_excluded_drugs`.
 - If `estimated_annual_oop` tail explodes (very high p99), inspect pricing calibration and `UNIT_COST` quantiles before retraining.
 
 ## Output Expectations
