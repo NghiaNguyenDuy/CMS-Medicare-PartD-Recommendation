@@ -238,6 +238,7 @@ flowchart LR
 | Table | Rows | Purpose |
 |-------|------|---------|
 | `synthetic.syn_beneficiary` | 10,000 | Test beneficiary profiles | `bene_synth_id`, location, `unique_drugs`, `insulin_user_flag`, `risk_segment` |
+| `synthetic.syn_beneficiary_prescriptions` | ~40K-70K | Beneficiary-level synthetic prescriptions sampled from CMS formulary coverage and RXCUI naming reference | `bene_synth_id`, `ndc`, `rxcui`, `drug_name`, `fills_per_year`, `is_insulin`, restriction flags |
 
 ---
 
@@ -321,7 +322,15 @@ The system creates **18+ features** for each beneficiary-plan pair:
 - `has_distance_tradeoff` (BOOLEAN): 1 if plan is far but cheap
 
 #### 6. Target Variable
-- `total_cost_with_distance` (DECIMAL): Annual premium (×12) + estimated OOP + distance penalty
+- total_cost_with_distance (DECIMAL): annual premium (x12) + estimated OOP + distance penalty
+
+estimated_annual_oop is computed from beneficiary-level prescription baskets (synthetic.syn_beneficiary_prescriptions) using SPUF-style approximations:
+- preferred-retail COST_TYPE_PREF + COST_AMT_PREF from bronze.brz_beneficiary_cost
+- deductible applicability (DED_APPLIES_YN / DEDUCTIBLE_APPLIES) with beneficiary-level deductible allocation
+- insulin copay rows from bronze.brz_insulin_cost with 30-day-equivalent cap proxy
+- uncovered/excluded formulary drug matches treated as full gross cost burden
+- when bronze.brz_pricing is available, UNIT_COST-based gross cost is calibrated before use:
+  winsorized by days-supply quantiles, bounded vs historical synthetic annual cost, then blended with the historical estimate
 
 ### Model Training & Outputs
 
@@ -423,7 +432,7 @@ data/SPUF/
 
 ```bash
 # Migrate SPUF parquet files to DuckDB
-python scripts/migrate_to_duckdb.py --force
+python scripts/migrate_to_duckdb.py --force  # one-time bootstrap only
 ```
 
 **Expected Output:**
@@ -433,7 +442,7 @@ python scripts/migrate_to_duckdb.py --force
 
 **Validation:**
 ```bash
-python -c "from db.db_manager import get_db; db = get_db(); print('Tables:', len([t for t in db.sql('SHOW TABLES').fetchall()]))"
+python -c "from db.db_manager import get_db; db = get_db(read_only=True); print('Tables:', len(db.list_tables()))"
 ```
 
 #### 4. Add Reference Data
@@ -475,9 +484,11 @@ python scripts/generate_beneficiary_profiles.py
 
 **Expected Output:**
 - `synthetic.syn_beneficiary` table with 10K rows
+- `synthetic.syn_beneficiary_prescriptions` table with beneficiary-level drug rows
 - County assignments based on plan availability
 - ~15% insulin users
-- Realistic drug utilization patterns
+- Drug utilization patterns based on CMS-covered formulary NDCs
+- Drug names enriched from `data/rxcui_info/*.csv`
 
 #### 7. Create ML Layer (Feature Engineering)
 
@@ -524,7 +535,7 @@ python ml_model/train_model_from_db.py
 source .env/bin/activate  # macOS/Linux
 
 # Run complete pipeline
-python scripts/migrate_to_duckdb.py --force
+python scripts/migrate_to_duckdb.py --force  # one-time bootstrap only
 python db/bronze/06_ingest_insulin_ref.py
 python db/bronze/05_ingest_geography.py
 python db/gold/03_dim_zipcode.py
@@ -567,8 +578,8 @@ Opens in browser at `http://localhost:8501`
 
 - **State & County Selection**: Choose location from dropdown
 - **Medication List**: 
-  - Enter NDC codes directly, OR
   - Search by drug name (autocomplete)
+  - Select matched medications (app maps selections to covered NDCs internally)
   - Add multiple medications
 - **Additional Inputs**:
   - Number of annual fills per drug
@@ -646,7 +657,7 @@ For each recommended plan, shows:
 ```python
 from db.db_manager import get_db
 
-db = get_db()
+db = get_db(read_only=True)
 
 # Get all MA-PD plans in LA County
 query = """
@@ -661,7 +672,7 @@ WHERE p.COUNTY_CODE = '06037'  -- LA County
 ORDER BY p.PREMIUM
 """
 
-plans_df = db.sql(query).df()
+plans_df = db.query_df(query)
 print(plans_df.head())
 ```
 
@@ -679,7 +690,7 @@ FROM gold.agg_plan_formulary_metrics fm
 WHERE fm.PLAN_KEY = 'H1234-001-000'
 """
 
-metrics = db.sql(query).df().iloc[0]
+metrics = db.query_df(query).iloc[0]
 print(f"Coverage: {metrics['formulary_breadth_pct']:.1%}")
 print(f"PA Rate: {metrics['pa_rate']:.1%}")
 ```
@@ -699,7 +710,7 @@ WHERE bene_synth_id = 'BENE_00001'
 ORDER BY recommendation_rank
 """
 
-recommendations = db.sql(query).df()
+recommendations = db.query_df(query)
 print(recommendations)
 ```
 
@@ -826,13 +837,13 @@ agent-code/
 │   ├── utils/                         # Database utilities
 │   │   └── validate_schema.py
 │   ├── db_manager.py                  # Database connection manager
-│   ├── plan_repository.py             # Plan data access
-│   └── formulary_repository.py        # Formulary data access
+│   ├── run_full_pipeline.py           # Layer orchestration
+│   └── README.md                      # Executable db module map
 │
 ├── ml_model/                          # ML model training
 │   ├── train_model_from_db.py         # LightGBM training from DuckDB ⭐
-│   ├── train_ranking_model.py         # (Legacy: parquet-based)
-│   └── feature_engineering.py         # (Legacy: parquet-based)
+│   ├── ranking_utils.py               # Ranking label/group utilities
+│   └── __init__.py
 │
 ├── app/                               # Streamlit applications
 │   └── streamlit_app_interactive.py   # Real-time ML inference app ⭐
@@ -840,7 +851,7 @@ agent-code/
 ├── scripts/                           # ETL and utility scripts
 │   ├── migrate_to_duckdb.py           # SPUF → DuckDB migration ⭐
 │   ├── generate_beneficiary_profiles.py  # Synthetic beneficiaries
-│   └── load_cms_raw.py                # (Legacy: parquet ETL)
+│   └── spark_version/                 # Legacy notebook experiments
 │
 ├── models/
 │   └── plan_ranker.pkl                # Trained LightGBM model ⭐
@@ -935,7 +946,7 @@ python ml_model/train_model_from_db.py
 Or use pre-computed recommendations (no model needed):
 
 ```bash
-streamlit run app/streamlit_app_ml.py  # Uses ml.recommendation_explanations
+streamlit run app/streamlit_app_interactive.py
 ```
 
 #### 5. No Plans Found for County
@@ -1094,3 +1105,4 @@ For questions, feedback, or collaboration:
 **Last Updated**: February 6, 2026  
 **Version**: 2.0  
 **Database**: medicare_part_d.duckdb (SPUF 2025 Q3)
+

@@ -220,7 +220,10 @@ If you need synthetic beneficiary data for testing:
 python scripts/generate_beneficiary_profiles.py
 ```
 
-**Note:** This creates `synthetic.syn_beneficiary` table which is required for ML layer.
+**Note:** This creates:
+- `synthetic.syn_beneficiary`
+- `synthetic.syn_beneficiary_prescriptions` (beneficiary-level CMS-covered drug rows)
+- Drug names in prescriptions are enriched from `data/rxcui_info/*.csv`
 
 ### Step 5: ML Layer - Feature Engineering and Training Data
 
@@ -252,6 +255,8 @@ python -m db.run_full_pipeline --layers ml
 **Training pairs:**
 - Beneficiary-plan combinations with county constraints
 - Plan features + distance + OOP estimates
+- OOP is computed with SPUF-style rules (copay/coinsurance, deductible applicability, insulin copay handling, uncovered-drug burden)
+- If `bronze.brz_pricing` exists, UNIT_COST-based gross drug costs are calibrated with winsorization + bounded blend to historical synthetic costs before OOP aggregation
 
 **Recommendation explanations:**
 - Top 5 recommendations per beneficiary

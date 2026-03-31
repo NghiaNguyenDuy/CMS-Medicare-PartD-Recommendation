@@ -63,8 +63,18 @@ def create_recommendation_explanations():
             rr.plan_key,
             rr.recommendation_rank,
             rr.estimated_annual_oop,
+            rr.oop_copay_component,
+            rr.oop_coinsurance_component,
+            rr.oop_deductible_component,
+            rr.oop_insulin_component,
+            rr.oop_uncovered_component,
+            rr.covered_drug_count,
+            rr.uncovered_drug_count,
             rr.plan_premium,
             rr.plan_deductible,
+            rr.total_annual_cost,
+            rr.distance_penalty,
+            rr.total_cost_with_distance,
             rr.distance_miles,
             rr.distance_category,
             rr.has_distance_tradeoff,
@@ -72,12 +82,28 @@ def create_recommendation_explanations():
             rr.bene_insulin_user,
             
             -- Cost explanation
-            PRINTF('Annual cost: $%.2f (Premium: $%.2f/mo, Deductible: $%.2f, Est. OOP: $%.2f)',
-                rr.plan_premium * 12 + rr.estimated_annual_oop,
-                rr.plan_premium,
-                rr.plan_deductible,
-                rr.estimated_annual_oop
+            PRINTF(
+                'Objective cost: $%.2f (Annual premium: $%.2f, Est. OOP: $%.2f, Distance penalty: $%.2f)',
+                rr.total_cost_with_distance,
+                rr.total_annual_cost - rr.estimated_annual_oop,
+                rr.estimated_annual_oop,
+                rr.distance_penalty
             ) AS cost_explanation,
+            PRINTF(
+                'OOP breakdown - copay: $%.2f, coinsurance: $%.2f, deductible effect: $%.2f, insulin: $%.2f, uncovered: $%.2f',
+                rr.oop_copay_component,
+                rr.oop_coinsurance_component,
+                rr.oop_deductible_component,
+                rr.oop_insulin_component,
+                rr.oop_uncovered_component
+            ) AS oop_explanation,
+            PRINTF(
+                'Base annual cost before distance: $%.2f (Deductible: $%.2f, covered drugs: %d, uncovered drugs: %d)',
+                rr.total_annual_cost,
+                rr.plan_deductible,
+                rr.covered_drug_count,
+                rr.uncovered_drug_count
+            ) AS annual_cost_breakdown,
             
             -- Distance explanation
             CASE
@@ -169,7 +195,7 @@ def create_recommendation_explanations():
         FROM ml.recommendation_explanations;
     """)
     
-    print(f"\n✓ Recommendation explanations generated:")
+    print("\n[OK] Recommendation explanations generated:")
     print(f"  - Total recommendations: {stats['total_recommendations'][0]:,}")
     print(f"  - Unique beneficiaries: {stats['unique_benes'][0]:,}")
     print(f"\n  Warnings/Flags:")
@@ -197,10 +223,14 @@ def create_recommendation_explanations():
     if len(sample) > 0:
         print(f"\n   Beneficiary: {sample['bene_synth_id'][0]}")
         for _, row in sample.iterrows():
-            print(f"\n   Rank {row['recommendation_rank']}: {row['PLAN_KEY']}")
-            print(f"   {row['recommendation_label']}")
-            print(f"   {row['cost_explanation']}")
-            print(f"   {row['distance_explanation']}")
+            plan_key_value = row.get('plan_key', row.get('PLAN_KEY', 'UNKNOWN'))
+            recommendation_label = str(row['recommendation_label']).encode('ascii', 'ignore').decode('ascii')
+            cost_explanation = str(row['cost_explanation']).encode('ascii', 'ignore').decode('ascii')
+            distance_explanation = str(row['distance_explanation']).encode('ascii', 'ignore').decode('ascii')
+            print(f"\n   Rank {row['recommendation_rank']}: {plan_key_value}")
+            print(f"   {recommendation_label}")
+            print(f"   {cost_explanation}")
+            print(f"   {distance_explanation}")
     
     return True
 

@@ -5,9 +5,8 @@ Provides data access layer for Medicare Part D recommendation system.
 
 Components:
 - db_manager: Connection management and query utilities
-- plan_repository: Plan data access methods
-- formulary_repository: Formulary and coverage data access
-- beneficiary_repository: Beneficiary profile data access
+- run_full_pipeline: Layer orchestration entrypoint
+- bronze/gold/ml: Layer-specific table build scripts
 """
 
 __version__ = '1.0.0'

@@ -3,3 +3,5 @@ venv/
 archive/
 .venv/
 *.duckdb
+__pycache__/
+*.pyc

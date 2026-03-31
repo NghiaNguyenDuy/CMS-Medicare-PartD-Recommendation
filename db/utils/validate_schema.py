@@ -1,7 +1,7 @@
 """
 Schema Validation and Workflow Review
 
-Validates the synthetic.syn_beneficiary table schema and checks
+Validates synthetic-layer schemas and checks
 alignment with downstream ML scripts.
 """
 
@@ -14,11 +14,11 @@ import pandas as pd
 
 
 def validate_schema():
-    """Check synthetic.syn_beneficiary schema."""
+    """Check synthetic-layer schemas."""
     db = get_db()
     
     print("=" * 70)
-    print("SCHEMA VALIDATION: synthetic.syn_beneficiary")
+    print("SCHEMA VALIDATION: synthetic layer")
     print("=" * 70)
     
     # 1. Check table exists
@@ -29,7 +29,12 @@ def validate_schema():
         print("\n   Run: python scripts/generate_beneficiary_profiles.py")
         return False
     
-    print("   ✓ Table exists")
+    print("   ✓ synthetic.syn_beneficiary exists")
+    if 'synthetic.syn_beneficiary_prescriptions' in tables:
+        print("   ✓ synthetic.syn_beneficiary_prescriptions exists")
+    else:
+        print("   ⚠ synthetic.syn_beneficiary_prescriptions NOT FOUND")
+        print("     Re-run: python scripts/generate_beneficiary_profiles.py")
     
     # 2. Show schema
     print("\n2. Table Schema")
@@ -38,7 +43,12 @@ def validate_schema():
     
     # 3. Row count
     row_count = db.query_one("SELECT COUNT(*) FROM synthetic.syn_beneficiary")[0]
-    print(f"\n3. Row Count: {row_count:,}")
+    print(f"\n3. syn_beneficiary Row Count: {row_count:,}")
+    try:
+        rx_row_count = db.query_one("SELECT COUNT(*) FROM synthetic.syn_beneficiary_prescriptions")[0]
+        print(f"   syn_beneficiary_prescriptions Row Count: {rx_row_count:,}")
+    except:
+        pass
     
     # 4. Sample data
     print("\n4. Sample Data (first 3 rows)")
@@ -186,7 +196,7 @@ def suggest_fixes():
     print("""
 STEP 1: Generate Beneficiaries
    Command: python scripts/generate_beneficiary_profiles.py
-   Creates: synthetic.syn_beneficiary (with county, but no zip)
+   Creates: synthetic.syn_beneficiary and synthetic.syn_beneficiary_prescriptions
 
 STEP 2: Assign Zip Codes  
    Command: python db/ml/02_assign_geography.py
@@ -216,6 +226,7 @@ FULL PIPELINE:
     
     checks = [
         ('synthetic.syn_beneficiary', 'Beneficiary table'),
+        ('synthetic.syn_beneficiary_prescriptions', 'Beneficiary drug rows'),
         ('bronze.brz_plan_info', 'Bronze plan data'),
         ('bronze.brz_insulin_ref', 'Insulin reference'),
         ('gold.agg_plan_formulary_metrics', 'Formulary metrics'),

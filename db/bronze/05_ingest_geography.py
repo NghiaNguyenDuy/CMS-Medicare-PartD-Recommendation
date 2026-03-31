@@ -28,10 +28,14 @@ def ingest_zipcode_geo():
     print("Bronze Ingestion: Zipcode Geography")
     print("=" * 60)
     
-    # Read CSV
-    zip_file = Path("data/dim_zipcode_geo.csv")
-    if not zip_file.exists():
-        print(f"ERROR: {zip_file} not found!")
+    # Read CSV (support current and legacy locations)
+    candidate_files = [
+        Path("data/dim_zipcode_geo.csv"),
+        Path("data/temp/dim_zipcode_geo.csv"),
+    ]
+    zip_file = next((path for path in candidate_files if path.exists()), None)
+    if zip_file is None:
+        print("ERROR: dim_zipcode_geo.csv not found in data/ or data/temp/")
         return False
     
     print(f"\n1. Loading {zip_file}...")
