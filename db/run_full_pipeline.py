@@ -55,8 +55,7 @@ def run_pipeline(layers=None, force=False):
         print("=" * 70)
 
         db = get_db()
-        tables = db.list_tables()
-        if not any("brz_plan_info" in t for t in tables):
+        if not db.has_table("bronze.brz_plan_info"):
             print("[ERROR] bronze.brz_plan_info not found.")
             print("Run one-time bootstrap first: python scripts/migrate_to_duckdb.py --force")
             return False

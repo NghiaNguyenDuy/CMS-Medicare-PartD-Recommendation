@@ -35,6 +35,60 @@ DEFAULT_SEED = 42
 DEFAULT_RXCUI_INFO_DIR = Path("data/rxcui_info")
 
 
+def normalize_county_code(value) -> str:
+    """Normalize county codes to zero-padded 5-character strings."""
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if text == "":
+        return ""
+    try:
+        return str(int(float(text))).zfill(5)
+    except (TypeError, ValueError):
+        return text.zfill(5) if text.isdigit() else text
+
+
+def build_county_assignment_weights(geo_df: pd.DataFrame, zip_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build county assignment weights with a robust state fallback.
+
+    `bronze.brz_geographic.STATE_LABEL` is the preferred source.
+    `bronze.brz_zipcode.state` repairs counties where the label is blank.
+    """
+    geo = geo_df.copy()
+    geo.columns = [str(c).strip().lower() for c in geo.columns]
+    geo["county_code"] = geo["county_code"].map(normalize_county_code)
+    geo["state"] = geo.get("state_label", "").astype(str).str.strip().str.upper()
+    geo["state"] = geo["state"].replace({"": np.nan, "NONE": np.nan, "NAN": np.nan})
+
+    zip_lookup = zip_df.copy()
+    zip_lookup.columns = [str(c).strip().lower() for c in zip_lookup.columns]
+    zip_lookup["county_code"] = zip_lookup["county_code"].map(normalize_county_code)
+    zip_lookup["state"] = zip_lookup["state"].astype(str).str.strip().str.upper()
+    zip_lookup["state"] = zip_lookup["state"].replace({"": np.nan, "NONE": np.nan, "NAN": np.nan})
+    zip_lookup = (
+        zip_lookup.dropna(subset=["county_code", "state"])
+        .groupby(["county_code", "state"], as_index=False)
+        .size()
+        .sort_values(["county_code", "size", "state"], ascending=[True, False, True])
+        .drop_duplicates(subset=["county_code"], keep="first")
+        .rename(columns={"size": "zip_rows"})
+    )
+
+    geo["state"] = geo["state"].fillna(geo["county_code"].map(zip_lookup.set_index("county_code")["state"]))
+    geo = geo.dropna(subset=["county_code", "state"]).copy()
+    geo = geo[geo["county_code"].isin(set(zip_lookup["county_code"]))].copy()
+
+    county_weights = (
+        geo.groupby(["county_code", "state"], as_index=False)
+        .size()
+        .rename(columns={"size": "weight"})
+        .sort_values(["weight", "county_code"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+    return county_weights
+
+
 def assign_risk_segment(cost_series: pd.Series) -> pd.Series:
     """Assign LOW/MED/HIGH risk bands from estimated annual cost."""
     risk = pd.cut(
@@ -598,17 +652,24 @@ def assign_geography(bene_df, seed=DEFAULT_SEED):
     print("\nAssigning geographic locations...")
 
     try:
-        county_weights = db.query_df(
+        geo_df = db.query_df(
             """
             SELECT
                 CAST(county_code AS VARCHAR) AS county_code,
-                CAST(state_label AS VARCHAR) AS state,
-                COUNT(*) AS weight
+                CAST(state_label AS VARCHAR) AS state_label
             FROM bronze.brz_geographic
-            GROUP BY county_code, state_label
-            ORDER BY weight DESC
             """
         )
+        zip_df = db.query_df(
+            """
+            SELECT
+                CAST(county_code AS VARCHAR) AS county_code,
+                CAST(state AS VARCHAR) AS state
+            FROM bronze.brz_zipcode
+            WHERE county_code IS NOT NULL
+            """
+        )
+        county_weights = build_county_assignment_weights(geo_df, zip_df)
     except Exception as exc:
         county_weights = pd.DataFrame()
         print(f"[WARN] Could not load bronze.brz_geographic: {exc}")
@@ -632,7 +693,12 @@ def assign_geography(bene_df, seed=DEFAULT_SEED):
 
     bene_df = bene_df.copy()
     bene_df["county_code"] = pd.Series(assigned).astype(str)
-    bene_df["state"] = bene_df["county_code"].map(state_map).fillna("NA")
+    bene_df["state"] = bene_df["county_code"].map(state_map)
+
+    missing_states = bene_df["state"].isna()
+    if missing_states.any():
+        print(f"[WARN] {int(missing_states.sum()):,} beneficiaries had missing state after county assignment; dropping those rows.")
+        bene_df = bene_df[~missing_states].copy()
 
     print(f"[OK] Counties assigned: {bene_df['county_code'].nunique():,}")
     print(f"[OK] States assigned: {bene_df['state'].nunique():,}")

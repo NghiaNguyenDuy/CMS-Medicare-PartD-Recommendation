@@ -24,12 +24,42 @@ import plotly.graph_objects as go
 from pathlib import Path
 import sys
 import pickle
+import json
+import hashlib
+import uuid
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from db.db_manager import get_db
 from utils.drug_input import normalize_ndc_token, summarize_medication_rows
+from recommendation_engine.plan_data import (
+    deduplicate_plan_candidates,
+    fetch_plan_drug_coverage,
+    fetch_plans_for_service_area,
+)
+from recommendation_engine.decision_support import (
+    DEFAULT_RESEARCH_SEED,
+    MedicationListItem,
+    PreferenceWeights,
+    ProfileInput,
+    as_public_types,
+    build_recommendation_schema,
+    classify_coverage_status,
+    compute_feature_coverage,
+    compute_heuristic_score,
+    create_run_audit,
+    estimate_plan_oop_with_breakdown,
+    serialize_nested_columns,
+)
+from recommendation_engine.research_eval import (
+    build_data_coverage_diagnostics,
+    build_fairness_tables,
+    compute_preference_stability,
+    evaluate_model_vs_baseline,
+    load_research_sample,
+    score_research_sample,
+)
 
 # ===== Page Configuration =====
 st.set_page_config(
@@ -463,7 +493,7 @@ def get_nearby_counties(user_zip, state_name, max_distance_miles=50):
         FROM gold.dim_zipcode
         WHERE state = ?
         GROUP BY county_code, state, county
-    )
+    ),
     county_distances AS (
         SELECT 
             cc.county_code,
@@ -508,44 +538,7 @@ def get_plans_for_location(state, county_code):
         pd.DataFrame: Available plans with features
     """
     db = get_database()
-    
-    query = """
-        SELECT
-            p.PLAN_KEY,
-            p.PLAN_NAME,
-            p.CONTRACT_NAME,
-            p.FORMULARY_ID,
-            CASE WHEN p.IS_MA_PD THEN 'MA' WHEN p.IS_PDP THEN 'PDP' ELSE 'Other' END as contract_type,
-            CAST(p.PREMIUM AS DOUBLE) as premium,
-            CAST(p.DEDUCTIBLE AS DOUBLE) as deductible,
-            
-            -- Formulary metrics (corrected column names)
-            CAST(COALESCE(fm.generic_tier_pct, 0) AS DOUBLE) as formulary_generic_pct,
-            CAST(COALESCE(fm.specialty_tier_pct, 0) AS DOUBLE) as formulary_specialty_pct,
-            CAST(COALESCE(fm.pa_rate, 0) AS DOUBLE) as formulary_pa_rate,
-            CAST(COALESCE(fm.st_rate, 0) AS DOUBLE) as formulary_st_rate,
-            CAST(COALESCE(fm.ql_rate, 0) AS DOUBLE) as formulary_ql_rate,
-            CAST(COALESCE(fm.restrictiveness_class, 0) AS INTEGER) as formulary_restrictiveness,
-            
-            -- Network metrics (corrected column names)
-            CAST(COALESCE(nm.preferred_pharmacies, 0) AS INTEGER) as network_preferred_pharmacies,
-            CAST(COALESCE(nm.total_pharmacies, 0) AS INTEGER) as network_total_pharmacies,
-            CAST(COALESCE(nm.network_adequacy_flag, 0) AS INTEGER) as network_adequacy_flag,
-            
-            -- Distance (estimate)
-            CAST(5.0 AS DOUBLE) as distance_miles,
-            CAST(0 AS INTEGER) as has_distance_tradeoff
-            
-        FROM bronze.brz_plan_info p
-        LEFT JOIN gold.agg_plan_formulary_metrics fm ON p.PLAN_KEY = fm.PLAN_KEY
-        LEFT JOIN gold.agg_plan_network_metrics nm ON p.PLAN_KEY = nm.plan_key
-        WHERE p.STATE = ?
-            AND p.COUNTY_CODE = ?
-            AND p.PREMIUM IS NOT NULL
-    """
-    
-    plans_df = db.query_df(query, [state, county_code])
-    return plans_df
+    return fetch_plans_for_service_area(db, state, county_code)
 
 
 @st.cache_data(ttl=1800)
@@ -664,99 +657,8 @@ def get_plan_drug_coverage(plan_keys, requested_ndcs):
     Returns:
         pd.DataFrame: PLAN_KEY-level requested-drug coverage summary
     """
-    plan_keys = tuple(str(pk) for pk in (plan_keys or ()))
-    requested_ndcs = tuple(str(ndc) for ndc in (requested_ndcs or ()))
-
-    if len(plan_keys) == 0 or len(requested_ndcs) == 0:
-        return pd.DataFrame(columns=[
-            "PLAN_KEY",
-            "requested_drugs",
-            "covered_drugs",
-            "in_formulary_drugs",
-            "excluded_drugs",
-            "uncovered_ndcs",
-            "drug_coverage_pct",
-        ])
-
     db = get_database()
-    plan_placeholders = ", ".join(["?"] * len(plan_keys))
-    requested_union = " UNION ALL ".join(["SELECT ? AS ndc"] * len(requested_ndcs))
-
-    sql = f"""
-        WITH candidate_plans AS (
-            SELECT DISTINCT
-                PLAN_KEY,
-                FORMULARY_ID
-            FROM bronze.brz_plan_info
-            WHERE PLAN_KEY IN ({plan_placeholders})
-        ),
-        requested AS (
-            {requested_union}
-        ),
-        grid AS (
-            SELECT
-                cp.PLAN_KEY,
-                cp.FORMULARY_ID,
-                r.ndc
-            FROM candidate_plans cp
-            CROSS JOIN (SELECT DISTINCT ndc FROM requested) r
-        ),
-        coverage_raw AS (
-            SELECT
-                g.PLAN_KEY,
-                g.FORMULARY_ID,
-                g.ndc,
-                bf.RXCUI,
-                bf.NDC AS covered_ndc
-            FROM grid g
-            LEFT JOIN bronze.brz_basic_formulary bf
-                ON bf.FORMULARY_ID = g.FORMULARY_ID
-               AND bf.NDC = g.ndc
-        ),
-        coverage_eval AS (
-            SELECT
-                c.PLAN_KEY,
-                c.ndc,
-                CASE
-                    WHEN c.covered_ndc IS NULL THEN 0
-                    WHEN ex.RXCUI IS NOT NULL THEN 0
-                    ELSE 1
-                END AS is_covered,
-                CASE WHEN c.covered_ndc IS NOT NULL THEN 1 ELSE 0 END AS in_formulary,
-                CASE WHEN ex.RXCUI IS NOT NULL THEN 1 ELSE 0 END AS is_excluded
-            FROM coverage_raw c
-            LEFT JOIN bronze.brz_excluded_drugs ex
-                ON ex.FORMULARY_ID = c.FORMULARY_ID
-               AND ex.RXCUI = c.RXCUI
-        )
-        SELECT
-            PLAN_KEY,
-            COUNT(*) AS requested_drugs,
-            SUM(is_covered) AS covered_drugs,
-            SUM(in_formulary) AS in_formulary_drugs,
-            SUM(is_excluded) AS excluded_drugs,
-            STRING_AGG(
-                CASE WHEN is_covered = 0 THEN ndc ELSE NULL END,
-                ', ' ORDER BY ndc
-            ) AS uncovered_ndcs
-        FROM coverage_eval
-        GROUP BY PLAN_KEY
-    """
-
-    params = list(plan_keys) + list(requested_ndcs)
-    coverage_df = db.query_df(sql, params)
-
-    if len(coverage_df) == 0:
-        return coverage_df
-
-    coverage_df["requested_drugs"] = pd.to_numeric(coverage_df["requested_drugs"], errors="coerce").fillna(0)
-    coverage_df["covered_drugs"] = pd.to_numeric(coverage_df["covered_drugs"], errors="coerce").fillna(0)
-    coverage_df["drug_coverage_pct"] = np.where(
-        coverage_df["requested_drugs"] > 0,
-        100.0 * coverage_df["covered_drugs"] / coverage_df["requested_drugs"],
-        0.0,
-    )
-    return coverage_df
+    return fetch_plan_drug_coverage(db, plan_keys, requested_ndcs)
 
 
 @st.cache_data(ttl=3600)
@@ -1151,7 +1053,14 @@ def render_county_access_visualization(state_name, county_name, state_code, coun
 
 
 # ===== Rank Plans using ML Model =====
-def rank_plans(plans_df, beneficiary_profile, model_data, decision_weights, distance_penalty_rate=50.0):
+def rank_plans(
+    plans_df,
+    beneficiary_profile,
+    model_data,
+    decision_weights,
+    distance_penalty_rate=50.0,
+    medication_rows=None,
+):
     """
     Rank plans for a beneficiary using ML model.
     Now includes pharmacy-level network analysis for accurate distances.
@@ -1169,6 +1078,8 @@ def rank_plans(plans_df, beneficiary_profile, model_data, decision_weights, dist
     if model_data is None:
         st.error("Model not loaded. Please train the model first.")
         return None
+    if len(plans_df) == 0:
+        return pd.DataFrame()
     
     model = model_data['model']
     feature_names = model_data['feature_names']
@@ -1187,6 +1098,7 @@ def rank_plans(plans_df, beneficiary_profile, model_data, decision_weights, dist
                 network_metrics = calculate_plan_network_metrics(pharmacy_dist)
                 # Merge with plans
                 plans_df = plans_df.merge(network_metrics, on='PLAN_KEY', how='left')
+                plans_df['has_pharmacy_distance_data'] = plans_df['nearest_preferred_miles'].notna().astype(int)
                 
                 # Fill missing values for plans without pharmacy data
                 plans_df['nearest_preferred_miles'] = plans_df['nearest_preferred_miles'].fillna(10.0)
@@ -1197,17 +1109,24 @@ def rank_plans(plans_df, beneficiary_profile, model_data, decision_weights, dist
                 plans_df['nearest_preferred_miles'] = 10.0
                 plans_df['preferred_within_10mi'] = plans_df.get('network_preferred_pharmacies', 0)
                 plans_df['network_accessibility_score'] = 50
+                plans_df['has_pharmacy_distance_data'] = 0
     else:
         # No zip code, use defaults
         plans_df['nearest_preferred_miles'] = 10.0
         plans_df['preferred_within_10mi'] = plans_df.get('network_preferred_pharmacies', 0)
         plans_df['network_accessibility_score'] = 50
+        plans_df['has_pharmacy_distance_data'] = 0
     
     # Create features for each plan
     features_list = []
+    oop_breakdowns = []
     
     for _, plan in plans_df.iterrows():
-        estimated_oop = estimate_plan_oop(beneficiary_profile, plan)
+        estimated_oop, oop_breakdown = estimate_plan_oop_with_breakdown(
+            beneficiary_profile,
+            plan,
+            medication_rows=medication_rows,
+        )
         model_distance = float(plan.get('nearest_preferred_miles', plan.get('distance_miles', 10.0)))
         distance_penalty = calculate_distance_penalty(model_distance, distance_penalty_rate)
         
@@ -1251,6 +1170,7 @@ def rank_plans(plans_df, beneficiary_profile, model_data, decision_weights, dist
         }
         
         features_list.append(features)
+        oop_breakdowns.append(oop_breakdown)
     
     # Create feature matrix
     X = pd.DataFrame(features_list)
@@ -1267,12 +1187,20 @@ def rank_plans(plans_df, beneficiary_profile, model_data, decision_weights, dist
     # Add scores and rank
     plans_df = plans_df.copy()
     plans_df['score'] = scores
+    plans_df['ml_score'] = scores
     plans_df['estimated_annual_oop'] = [f['total_drug_oop'] for f in features_list]
     plans_df['distance_penalty'] = [f['distance_penalty'] for f in features_list]
+    plans_df['oop_breakdown'] = oop_breakdowns
     plans_df['total_annual_cost'] = plans_df['premium'] * 12 + plans_df['estimated_annual_oop']
     plans_df['total_cost_with_distance'] = plans_df['total_annual_cost'] + plans_df['distance_penalty']
+    plans_df['estimated_total_annual_cost'] = plans_df['total_cost_with_distance']
+    if 'service_area_eligible' not in plans_df.columns:
+        plans_df['service_area_eligible'] = True
+    if 'eligibility_status' not in plans_df.columns:
+        plans_df['eligibility_status'] = 'Eligible'
 
     plans_df = compute_decision_support_scores(plans_df, decision_weights)
+    plans_df['heuristic_score'] = compute_heuristic_score(plans_df)
     plans_df = plans_df.sort_values(['decision_score', 'score'], ascending=[False, False]).reset_index(drop=True)
     plans_df['rank'] = range(1, len(plans_df) + 1)
     
@@ -1280,7 +1208,7 @@ def rank_plans(plans_df, beneficiary_profile, model_data, decision_weights, dist
 
 
 # ===== Main Application =====
-def main():
+def legacy_main():
     """Main Streamlit application logic."""
     
     # Header
@@ -1965,6 +1893,1134 @@ def main():
         
         st.markdown("---")
         st.info("**📌 Note:** This is a demonstration using a pre-trained LightGBM ranking model. Enter beneficiary details in the sidebar to get started!")
+
+def get_data_snapshot_id():
+    """Build a lightweight identifier for the current DuckDB snapshot."""
+    db_path = Path("data/medicare_part_d.duckdb")
+    if not db_path.exists():
+        return "missing-data-snapshot"
+
+    stat = db_path.stat()
+    fingerprint = f"{db_path.name}:{stat.st_size}:{int(stat.st_mtime)}"
+    return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:12]
+
+
+@st.cache_data(ttl=3600)
+def get_research_states():
+    """Return available states for research sampling."""
+    db = get_database()
+    query = """
+        SELECT DISTINCT bene_state
+        FROM ml.training_plan_pairs
+        WHERE bene_state IS NOT NULL
+          AND TRIM(CAST(bene_state AS VARCHAR)) != ''
+        ORDER BY bene_state
+    """
+    states = db.query_df(query)["bene_state"].astype(str).tolist()
+    return ["All"] + states
+
+
+def get_model_version(model_data):
+    """Create a stable display version for the current model artifact."""
+    model_path = Path("models/plan_ranker.pkl")
+    feature_names = model_data.get("feature_names", []) if model_data else []
+    stats = model_data.get("training_stats", {}) if model_data else {}
+    raw = {
+        "feature_count": len(feature_names),
+        "best_iteration": stats.get("best_iteration"),
+        "test_ndcg@3": stats.get("test_ndcg@3"),
+    }
+    if model_path.exists():
+        stat = model_path.stat()
+        raw["artifact_size"] = stat.st_size
+        raw["artifact_mtime"] = int(stat.st_mtime)
+    digest = hashlib.sha256(json.dumps(raw, sort_keys=True).encode("utf-8")).hexdigest()[:10]
+    return f"plan-ranker-{digest}"
+
+
+def init_app_state():
+    """Initialize Streamlit session state for the new app flows."""
+    defaults = {
+        "selected_medication_rows": [],
+        "recommendation_runs": {},
+        "active_run_id": None,
+        "research_outputs": None,
+        "last_profile_zip_lookup": None,
+        "profile_num_drugs": 3,
+        "profile_avg_fills_per_year": 12.0,
+        "profile_is_insulin_user": False,
+        "profile_total_rx_cost_est": 2000.0,
+        "profile_risk_segment": "Medium",
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def _coerce_list(value):
+    """Return a list from list-like or JSON-serialized values."""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            return [value]
+    return []
+
+
+def _coerce_dict(value):
+    """Return a dict from dict-like or JSON-serialized values."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return {}
+    return {}
+
+
+def render_profile_step():
+    """Render beneficiary profile inputs."""
+    st.subheader("1. Profile")
+    st.caption("Confirm the service area first. Recommendations only become strong when service area, coverage, and evidence quality line up.")
+
+    states = get_states()
+    if len(states) == 0:
+        st.error("No states were found in `gold.dim_zipcode`.")
+        return {}
+
+    if "profile_state_name" not in st.session_state or st.session_state["profile_state_name"] not in states:
+        st.session_state["profile_state_name"] = states[0]
+
+    zip_code_raw = st.text_input(
+        "ZIP code",
+        key="profile_zip_code",
+        max_chars=5,
+        placeholder="5-digit ZIP",
+        help="Used for service area lookup and pharmacy-distance estimation when available.",
+    )
+    zip_code = "".join(ch for ch in str(zip_code_raw or "") if ch.isdigit())[:5]
+
+    if len(zip_code) == 5:
+        location = get_location_from_zip(zip_code)
+        if location is not None:
+            if st.session_state.get("last_profile_zip_lookup") != zip_code:
+                if location["state"] in states:
+                    st.session_state["profile_state_name"] = location["state"]
+                    county_options = get_counties(location["state"])
+                    if location["county"] in county_options:
+                        st.session_state["profile_county_name"] = location["county"]
+                st.session_state["last_profile_zip_lookup"] = zip_code
+            st.success(f"ZIP lookup: {location['city']}, {location['state']} | {location['county']} County")
+        else:
+            st.warning("ZIP lookup did not find a matching county. You can still select state and county manually.")
+
+    state_name = st.selectbox("State", states, key="profile_state_name")
+    counties = get_counties(state_name)
+    if len(counties) == 0:
+        st.error(f"No counties were found for {state_name}.")
+        return {}
+
+    if "profile_county_name" not in st.session_state or st.session_state["profile_county_name"] not in counties:
+        st.session_state["profile_county_name"] = counties[0]
+    county_name = st.selectbox("County", counties, key="profile_county_name")
+
+    state_code, county_code = get_state_county_codes(state_name, county_name)
+    trust_col1, trust_col2 = st.columns(2)
+    if state_code and county_code:
+        trust_col1.success(f"Service area ready: {state_code} / {county_code}")
+    else:
+        trust_col1.error("State or county code could not be resolved.")
+    representative_zip = get_default_zip_for_county(state_name, county_name)
+    trust_col2.info(f"Representative county ZIP: {representative_zip or 'Not available'}")
+
+    st.markdown("#### Baseline Profile")
+    col1, col2, col3 = st.columns(3)
+    col1.selectbox(
+        "Risk segment",
+        ["Low", "Medium", "High"],
+        key="profile_risk_segment",
+        help="Used in research-style beneficiary profiling and evaluation slices.",
+    )
+    col2.number_input(
+        "Fallback number of medications",
+        min_value=1,
+        max_value=20,
+        step=1,
+        key="profile_num_drugs",
+        help="Used only when no medication list is supplied.",
+    )
+    col3.number_input(
+        "Fallback avg fills per year",
+        min_value=1.0,
+        max_value=100.0,
+        step=1.0,
+        key="profile_avg_fills_per_year",
+        help="Used only when no medication list is supplied.",
+    )
+
+    col4, col5 = st.columns(2)
+    col4.number_input(
+        "Fallback annual drug cost ($)",
+        min_value=100.0,
+        max_value=100000.0,
+        step=100.0,
+        key="profile_total_rx_cost_est",
+        help="Medication-list cost estimates override this when available.",
+    )
+    col5.checkbox(
+        "Fallback insulin user flag",
+        key="profile_is_insulin_user",
+        help="Medication entries can still signal insulin use automatically.",
+    )
+
+    return {
+        "state_name": state_name,
+        "county_name": county_name,
+        "state_code": state_code,
+        "county_code": county_code,
+        "zip_code": zip_code or None,
+        "risk_segment": st.session_state["profile_risk_segment"],
+        "num_drugs": int(st.session_state["profile_num_drugs"]),
+        "avg_fills_per_year": float(st.session_state["profile_avg_fills_per_year"]),
+        "is_insulin_user": bool(st.session_state["profile_is_insulin_user"]),
+        "total_rx_cost_est": float(st.session_state["profile_total_rx_cost_est"]),
+        "representative_zip": representative_zip,
+    }
+
+
+def render_medication_step():
+    """Render requested-medication capture and editing."""
+    st.subheader("2. Medications")
+    st.caption("Requested-drug coverage is treated as a first-class output. Add medications here to move the app from generic comparison toward beneficiary-specific decision support.")
+
+    drug_name_query = st.text_input(
+        "Search drug name or NDC",
+        key="medication_search_query",
+        placeholder="e.g., metformin or 00002871501",
+    )
+    drug_lookup = search_drug_catalog(drug_name_query, limit=30)
+
+    lookup_option_labels = ["Select a drug..."]
+    lookup_option_map = {}
+    if len(drug_lookup) > 0:
+        for _, row in drug_lookup.iterrows():
+            label = (
+                f"{row['drug_name']} [NDC {row['ndc']}] "
+                f"(tier {int(row.get('tier_level', 1))}, {int(row.get('days_supply_mode', 30))}d)"
+            )
+            if label not in lookup_option_map:
+                lookup_option_map[label] = row.to_dict()
+                lookup_option_labels.append(label)
+
+    col1, col2 = st.columns([2, 1])
+    selected_lookup_label = col1.selectbox(
+        "Search results",
+        options=lookup_option_labels,
+        index=0,
+        key="medication_lookup_selection",
+    )
+    manual_ndc = col2.text_input(
+        "Manual NDC",
+        key="manual_ndc_input",
+        placeholder="11-digit NDC",
+    )
+    manual_ndc_values = normalize_ndc_token(manual_ndc)
+
+    action_col1, action_col2, action_col3 = st.columns(3)
+    add_selected = action_col1.button(
+        "Add selected drug",
+        use_container_width=True,
+        disabled=selected_lookup_label == "Select a drug...",
+    )
+    add_manual = action_col2.button(
+        "Add manual NDC",
+        use_container_width=True,
+        disabled=len(manual_ndc_values) == 0,
+    )
+    clear_medications = action_col3.button("Clear list", use_container_width=True)
+
+    if add_selected and selected_lookup_label in lookup_option_map:
+        selected_row = lookup_option_map[selected_lookup_label]
+        selected_days_supply = pd.to_numeric(selected_row.get("days_supply_mode"), errors="coerce")
+        selected_tier = pd.to_numeric(selected_row.get("tier_level"), errors="coerce")
+        selected_fills = pd.to_numeric(selected_row.get("fills_per_year"), errors="coerce")
+        selected_insulin = pd.to_numeric(selected_row.get("is_insulin"), errors="coerce")
+        selected_annual_cost = pd.to_numeric(selected_row.get("annual_cost_est"), errors="coerce")
+
+        days_supply_mode = int(selected_days_supply) if pd.notna(selected_days_supply) else 30
+        if days_supply_mode not in (30, 60, 90):
+            days_supply_mode = 30 if days_supply_mode < 45 else (60 if days_supply_mode < 75 else 90)
+
+        new_row = {
+            "drug_name": str(selected_row.get("drug_name", "") or f"NDC {selected_row.get('ndc', '')}"),
+            "ndc": str(selected_row.get("ndc", "")),
+            "days_supply_mode": days_supply_mode,
+            "tier_level": min(7, max(1, int(selected_tier) if pd.notna(selected_tier) else 1)),
+            "fills_per_year": max(1.0, float(selected_fills) if pd.notna(selected_fills) else 12.0),
+            "is_insulin": bool(int(selected_insulin)) if pd.notna(selected_insulin) else False,
+            "annual_cost_est": max(0.0, float(selected_annual_cost) if pd.notna(selected_annual_cost) else 0.0),
+        }
+        existing_ndcs = {str(row.get("ndc", "")) for row in st.session_state["selected_medication_rows"]}
+        if new_row["ndc"] not in existing_ndcs:
+            st.session_state["selected_medication_rows"].append(new_row)
+            st.success(f"Added {new_row['drug_name']} ({new_row['ndc']}).")
+        else:
+            st.info(f"NDC {new_row['ndc']} is already in the medication list.")
+
+    if add_manual and len(manual_ndc_values) > 0:
+        ndc_value = manual_ndc_values[-1]
+        existing_ndcs = {str(row.get("ndc", "")) for row in st.session_state["selected_medication_rows"]}
+        if ndc_value not in existing_ndcs:
+            st.session_state["selected_medication_rows"].append(
+                {
+                    "drug_name": f"NDC {ndc_value}",
+                    "ndc": ndc_value,
+                    "days_supply_mode": 30,
+                    "tier_level": 1,
+                    "fills_per_year": 12.0,
+                    "is_insulin": False,
+                    "annual_cost_est": 0.0,
+                }
+            )
+            st.success(f"Added NDC {ndc_value}.")
+        else:
+            st.info(f"NDC {ndc_value} is already in the medication list.")
+
+    if clear_medications:
+        st.session_state["selected_medication_rows"] = []
+        st.info("Medication list cleared.")
+
+    medication_rows = st.session_state.get("selected_medication_rows", [])
+    if len(medication_rows) > 0:
+        med_df = pd.DataFrame(medication_rows)
+        edited_med_df = st.data_editor(
+            med_df,
+            hide_index=True,
+            num_rows="dynamic",
+            use_container_width=True,
+            key="wizard_selected_medication_editor",
+            column_config={
+                "drug_name": st.column_config.TextColumn("Drug name"),
+                "ndc": st.column_config.TextColumn("NDC"),
+                "days_supply_mode": st.column_config.SelectboxColumn("Days supply", options=[30, 60, 90], required=True),
+                "tier_level": st.column_config.SelectboxColumn("Tier", options=[1, 2, 3, 4, 5, 6, 7], required=True),
+                "fills_per_year": st.column_config.NumberColumn("Fills/year", min_value=1.0, max_value=100.0, step=1.0),
+                "is_insulin": st.column_config.CheckboxColumn("Insulin"),
+                "annual_cost_est": st.column_config.NumberColumn("Annual cost est ($)", min_value=0.0, max_value=100000.0, step=50.0),
+            },
+        )
+        medication_rows = edited_med_df.to_dict("records")
+    else:
+        st.info("No medications added yet. The app will fall back to the baseline profile values from step 1.")
+
+    medication_summary = summarize_medication_rows(medication_rows)
+    st.session_state["selected_medication_rows"] = medication_summary["rows"]
+
+    if medication_summary["num_drugs"] > 0:
+        metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+        metric_col1.metric("Unique medications", int(medication_summary["num_drugs"]))
+        metric_col2.metric("Avg fills/year", f"{medication_summary['avg_fills_per_year']:.1f}")
+        metric_col3.metric("Annual drug cost", f"${float(medication_summary['total_annual_drug_cost']):,.0f}")
+        metric_col4.metric("Insulin flagged", "Yes" if int(medication_summary["is_insulin_user"]) == 1 else "No")
+        st.caption(f"Requested NDCs: {', '.join(medication_summary['requested_ndcs'])}")
+
+    return medication_summary
+
+
+def render_preferences_step(medication_summary):
+    """Render beneficiary priorities and search controls."""
+    st.subheader("3. Preferences")
+    st.caption("Set how strict the app should be on local eligibility, requested-drug coverage, and access tradeoffs.")
+
+    has_medications = int(medication_summary.get("num_drugs", 0) or 0) > 0
+    if has_medications:
+        st.info("Medication list supplied. Coverage and cost estimation will use those requested drugs directly.")
+    else:
+        st.warning("No medication list supplied. Results will rely more on plan-level averages and should be treated as lower-confidence decision support.")
+
+    search_scope = st.radio(
+        "Search scope",
+        ["Local plans only", "Allow nearby comparison plans"],
+        index=0,
+        horizontal=True,
+        key="preference_search_scope",
+        help="Nearby plans are shown for comparison only. They are not treated as eligible recommendations for the selected county.",
+    )
+    local_only = search_scope == "Local plans only"
+
+    col1, col2, col3 = st.columns(3)
+    max_distance = col1.slider(
+        "Nearby comparison radius (miles)",
+        min_value=10,
+        max_value=100,
+        value=50,
+        step=10,
+        disabled=local_only,
+    )
+    min_drug_coverage_pct = col2.slider(
+        "Minimum requested-drug coverage (%)",
+        min_value=0,
+        max_value=100,
+        value=100 if has_medications else 0,
+        step=5,
+        disabled=not has_medications,
+        help="Only plans meeting this threshold are treated as recommendation-eligible when a medication list is present.",
+    )
+    distance_penalty_rate = col3.slider(
+        "Pharmacy-distance sensitivity",
+        min_value=10,
+        max_value=100,
+        value=50,
+        step=10,
+        help="Higher values penalize plans with weaker nearby preferred pharmacy access more heavily.",
+    )
+
+    st.markdown("#### Recommendation Weights")
+    weight_col1, weight_col2, weight_col3, weight_col4 = st.columns(4)
+    ml_influence_pct = weight_col1.slider("ML influence (%)", min_value=10, max_value=70, value=35, step=5)
+    cost_priority = weight_col2.slider("Cost priority", min_value=1, max_value=5, value=5)
+    access_priority = weight_col3.slider("Access priority", min_value=1, max_value=5, value=4)
+    coverage_priority = weight_col4.slider("Medication-fit priority", min_value=1, max_value=5, value=4)
+
+    decision_weights = build_decision_weights(
+        ml_influence_pct,
+        cost_priority,
+        access_priority,
+        coverage_priority,
+    )
+    st.caption(
+        "Final weighting mix: "
+        f"ML {decision_weights['ml']:.0%} | "
+        f"Cost {decision_weights['cost']:.0%} | "
+        f"Access {decision_weights['access']:.0%} | "
+        f"Coverage {decision_weights['coverage']:.0%}"
+    )
+
+    preference_contract = PreferenceWeights(
+        ml_weight=float(decision_weights["ml"]),
+        cost_weight=float(decision_weights["cost"]),
+        access_weight=float(decision_weights["access"]),
+        coverage_weight=float(decision_weights["coverage"]),
+        distance_penalty_rate=float(distance_penalty_rate),
+        minimum_coverage_pct=float(min_drug_coverage_pct),
+        local_only=bool(local_only),
+    )
+
+    return {
+        "decision_weights": decision_weights,
+        "preference_contract": preference_contract,
+        "max_distance": int(max_distance),
+        "distance_penalty_rate": float(distance_penalty_rate),
+        "minimum_coverage_pct": float(min_drug_coverage_pct),
+        "local_only": bool(local_only),
+        "ml_influence_pct": int(ml_influence_pct),
+    }
+
+
+def enrich_requested_drug_coverage(plans_df, requested_ndcs):
+    """Merge requested-drug coverage onto candidate plan rows."""
+    if len(plans_df) == 0:
+        return plans_df
+
+    requested_ndcs = tuple(str(ndc) for ndc in (requested_ndcs or ()))
+    enriched = plans_df.copy()
+    if len(requested_ndcs) == 0:
+        enriched["requested_drugs"] = 0
+        enriched["covered_drugs"] = 0
+        enriched["in_formulary_drugs"] = 0
+        enriched["excluded_drugs"] = 0
+        enriched["drug_coverage_pct"] = 0.0
+        enriched["uncovered_ndcs"] = ""
+        enriched["coverage_status"] = "Not evaluated"
+        return deduplicate_plan_candidates(enriched)
+
+    coverage_df = get_plan_drug_coverage(
+        tuple(enriched["PLAN_KEY"].astype(str).tolist()),
+        requested_ndcs,
+    )
+    if len(coverage_df) > 0:
+        enriched = enriched.merge(coverage_df, on="PLAN_KEY", how="left")
+    else:
+        enriched["requested_drugs"] = len(requested_ndcs)
+        enriched["covered_drugs"] = 0
+        enriched["in_formulary_drugs"] = 0
+        enriched["excluded_drugs"] = 0
+        enriched["drug_coverage_pct"] = 0.0
+        enriched["uncovered_ndcs"] = ""
+
+    for col, fill_value in [
+        ("requested_drugs", len(requested_ndcs)),
+        ("covered_drugs", 0),
+        ("in_formulary_drugs", 0),
+        ("excluded_drugs", 0),
+        ("drug_coverage_pct", 0.0),
+    ]:
+        if col not in enriched.columns:
+            enriched[col] = fill_value
+        enriched[col] = pd.to_numeric(enriched[col], errors="coerce").fillna(fill_value)
+    if "uncovered_ndcs" not in enriched.columns:
+        enriched["uncovered_ndcs"] = ""
+    enriched["uncovered_ndcs"] = enriched["uncovered_ndcs"].fillna("")
+    enriched["coverage_status"] = enriched["drug_coverage_pct"].apply(
+        lambda pct: classify_coverage_status(pct, requested_drugs=len(requested_ndcs))
+    )
+    return deduplicate_plan_candidates(enriched)
+
+
+def get_nearby_comparison_plans(state_name, state_code, county_code, user_zip, max_distance=50):
+    """Load nearby-county plans as comparison-only rows."""
+    if not user_zip:
+        return pd.DataFrame()
+
+    nearby_counties = get_nearby_counties(user_zip, state_name, max_distance)
+    if len(nearby_counties) == 0:
+        return pd.DataFrame()
+
+    target_county_code = str(county_code or "").zfill(5)
+    comparison_frames = []
+
+    for _, county_row in nearby_counties.iterrows():
+        county_code_raw = county_row.get("county_code")
+        try:
+            nearby_county_code = str(int(float(county_code_raw))).zfill(5)
+        except (TypeError, ValueError):
+            nearby_county_code = str(county_code_raw or "")
+
+        if not nearby_county_code or nearby_county_code == target_county_code:
+            continue
+
+        county_plans = get_plans_for_location(state_code, nearby_county_code)
+        if len(county_plans) == 0:
+            continue
+
+        county_plans = county_plans.copy()
+        county_plans["is_local"] = False
+        county_plans["service_area_eligible"] = False
+        county_plans["comparison_only"] = True
+        county_plans["eligibility_status"] = "Comparison only - outside selected service area"
+        county_plans["distance_miles"] = float(county_row.get("distance_miles", 0.0) or 0.0)
+        county_plans["distance_category"] = categorize_distance(county_plans["distance_miles"].iloc[0])
+        county_plans["location_county"] = county_row.get("county", "")
+        comparison_frames.append(county_plans)
+
+    if len(comparison_frames) == 0:
+        return pd.DataFrame()
+
+    combined = pd.concat(comparison_frames, ignore_index=True)
+    return deduplicate_plan_candidates(combined)
+
+
+def execute_decision_support_run(profile_inputs, medication_summary, preference_inputs, model_data):
+    """Run the staged decision-support pipeline and build audit artifacts."""
+    state_code = profile_inputs.get("state_code")
+    county_code = profile_inputs.get("county_code")
+    if not state_code or not county_code:
+        return {"error": "The selected state/county could not be resolved to a service area code."}
+
+    requested_ndcs = tuple(medication_summary.get("requested_ndcs", ()))
+    requested_name_map = dict(medication_summary.get("requested_name_map", {}))
+    medication_rows = medication_summary.get("rows", [])
+
+    num_drugs = int(medication_summary["num_drugs"]) if int(medication_summary.get("num_drugs", 0) or 0) > 0 else int(profile_inputs["num_drugs"])
+    avg_fills_per_year = float(medication_summary["avg_fills_per_year"]) if int(medication_summary.get("num_drugs", 0) or 0) > 0 else float(profile_inputs["avg_fills_per_year"])
+    total_rx_cost_est = float(medication_summary["total_annual_drug_cost"]) if float(medication_summary.get("total_annual_drug_cost", 0.0) or 0.0) > 0 else float(profile_inputs["total_rx_cost_est"])
+    is_insulin_user = int(medication_summary["is_insulin_user"]) if int(medication_summary.get("num_drugs", 0) or 0) > 0 else int(bool(profile_inputs["is_insulin_user"]))
+    effective_zip = profile_inputs.get("zip_code") or profile_inputs.get("representative_zip")
+
+    beneficiary_profile = {
+        "state": profile_inputs["state_name"],
+        "county": profile_inputs["county_name"],
+        "state_code": state_code,
+        "county_code": county_code,
+        "zip_code": effective_zip,
+        "num_drugs": num_drugs,
+        "avg_fills_per_year": avg_fills_per_year,
+        "is_insulin_user": is_insulin_user,
+        "total_rx_cost_est": total_rx_cost_est,
+        "risk_segment": profile_inputs["risk_segment"],
+    }
+
+    profile_contract = ProfileInput(
+        state=profile_inputs["state_name"],
+        county=profile_inputs["county_name"],
+        state_code=state_code,
+        county_code=county_code,
+        zip_code=effective_zip,
+        risk_segment=profile_inputs["risk_segment"],
+        num_drugs=num_drugs,
+        avg_fills_per_year=avg_fills_per_year,
+        is_insulin_user=is_insulin_user,
+        total_rx_cost_est=total_rx_cost_est,
+    )
+    medication_contract = [
+        MedicationListItem(
+            drug_name=str(row.get("drug_name", "")),
+            ndc=str(row.get("ndc", "")),
+            fills_per_year=float(row.get("fills_per_year", 12.0) or 12.0),
+            days_supply_mode=int(row.get("days_supply_mode", 30) or 30),
+            tier_level=int(row.get("tier_level", 1) or 1),
+            is_insulin=bool(row.get("is_insulin", False)),
+            annual_cost_est=float(row.get("annual_cost_est", 0.0) or 0.0),
+        )
+        for row in medication_rows
+    ]
+    preference_contract = preference_inputs["preference_contract"]
+    public_contract = as_public_types(profile_contract, medication_contract, preference_contract)
+
+    local_plans = get_plans_for_location(state_code, county_code)
+    local_plans = deduplicate_plan_candidates(local_plans)
+    local_plans = enrich_requested_drug_coverage(local_plans, requested_ndcs)
+
+    comparison_plans = pd.DataFrame()
+    if not preference_inputs["local_only"]:
+        comparison_plans = get_nearby_comparison_plans(
+            profile_inputs["state_name"],
+            state_code,
+            county_code,
+            effective_zip,
+            max_distance=preference_inputs["max_distance"],
+        )
+        comparison_plans = enrich_requested_drug_coverage(comparison_plans, requested_ndcs)
+
+    if len(local_plans) > 0 and len(requested_ndcs) > 0:
+        recommendation_candidates = local_plans[
+            pd.to_numeric(local_plans["drug_coverage_pct"], errors="coerce").fillna(0.0) >= float(preference_inputs["minimum_coverage_pct"])
+        ].copy()
+    else:
+        recommendation_candidates = local_plans.copy()
+
+    comparison_only = False
+    result_message = ""
+    if len(recommendation_candidates) == 0:
+        comparison_only = True
+        if len(local_plans) > 0:
+            recommendation_candidates = local_plans.copy()
+            result_message = (
+                f"No local plan met the requested-drug threshold of {int(preference_inputs['minimum_coverage_pct'])}%."
+                " Showing local plans in comparison-and-warning mode."
+            )
+        elif len(comparison_plans) > 0:
+            recommendation_candidates = comparison_plans.copy()
+            result_message = "No eligible local plans were found. Showing nearby county plans for comparison only."
+        else:
+            return {
+                "error": "No plans were found for the selected service area, and no nearby comparison plans were available.",
+                "public_contract": public_contract,
+            }
+    else:
+        result_message = "Eligible local plans were found and ranked within the selected service area."
+
+    ranked_recommendations = rank_plans(
+        recommendation_candidates,
+        beneficiary_profile,
+        model_data,
+        decision_weights=preference_inputs["decision_weights"],
+        distance_penalty_rate=preference_inputs["distance_penalty_rate"],
+        medication_rows=medication_rows,
+    )
+    ranked_comparison = pd.DataFrame()
+    if len(comparison_plans) > 0:
+        ranked_comparison = rank_plans(
+            comparison_plans,
+            beneficiary_profile,
+            model_data,
+            decision_weights=preference_inputs["decision_weights"],
+            distance_penalty_rate=preference_inputs["distance_penalty_rate"],
+            medication_rows=medication_rows,
+        )
+
+    run_id = uuid.uuid4().hex[:12]
+    recommendation_schema = build_recommendation_schema(
+        ranked_recommendations,
+        run_id=run_id,
+        requested_drugs=len(requested_ndcs),
+    )
+    comparison_schema = build_recommendation_schema(
+        ranked_comparison,
+        run_id=run_id,
+        requested_drugs=len(requested_ndcs),
+    ) if len(ranked_comparison) > 0 else pd.DataFrame()
+
+    coverage_source = recommendation_schema.copy()
+    if len(comparison_schema) > 0:
+        coverage_source = pd.concat([coverage_source, comparison_schema], ignore_index=True)
+    feature_coverage = compute_feature_coverage(coverage_source)
+
+    audit = create_run_audit(
+        user_input_summary=public_contract,
+        model_version=get_model_version(model_data),
+        data_snapshot=get_data_snapshot_id(),
+        seed=DEFAULT_RESEARCH_SEED,
+        feature_coverage=feature_coverage,
+        recommendations=recommendation_schema,
+        run_id=run_id,
+    )
+    audit["results_mode"] = "comparison_only" if comparison_only else "decision_support"
+    audit["result_message"] = result_message
+    audit["search_context"] = {
+        "local_candidates": int(len(local_plans)),
+        "recommendation_candidates": int(len(recommendation_candidates)),
+        "nearby_comparison_candidates": int(len(comparison_plans)),
+        "requested_drugs": int(len(requested_ndcs)),
+        "minimum_coverage_pct": float(preference_inputs["minimum_coverage_pct"]),
+        "local_only": bool(preference_inputs["local_only"]),
+    }
+
+    trusted_recommendation = False
+    if len(recommendation_schema) > 0:
+        top_plan = recommendation_schema.iloc[0]
+        trusted_recommendation = (
+            top_plan.get("eligibility_status") == "Eligible"
+            and top_plan.get("coverage_status") != "Poor fit"
+            and top_plan.get("confidence_band") in {"Medium", "High"}
+            and not comparison_only
+        )
+
+    return {
+        "run_id": run_id,
+        "public_contract": public_contract,
+        "audit": audit,
+        "feature_coverage": feature_coverage,
+        "recommendations": recommendation_schema,
+        "comparison_recommendations": comparison_schema,
+        "result_message": result_message,
+        "comparison_only": comparison_only,
+        "trusted_recommendation": trusted_recommendation,
+        "requested_ndcs": requested_ndcs,
+        "requested_name_map": requested_name_map,
+        "beneficiary_profile": beneficiary_profile,
+        "effective_zip": effective_zip,
+    }
+
+
+def render_featured_plan(plan_row, requested_name_map):
+    """Render the top recommendation card."""
+    cost_breakdown = _coerce_dict(plan_row.get("cost_breakdown", {}))
+    access_summary = _coerce_dict(plan_row.get("access_summary", {}))
+    warning_flags = _coerce_list(plan_row.get("warning_flags", []))
+    evidence_gaps = _coerce_list(plan_row.get("evidence_gaps", []))
+
+    st.subheader("Featured Plan")
+    st.markdown(f"### {plan_row['PLAN_NAME']}")
+    st.caption(f"{plan_row.get('contract_type', 'Unknown')} | {plan_row.get('eligibility_status', 'Unknown')}")
+
+    if plan_row.get("eligibility_status") == "Eligible" and plan_row.get("confidence_band") in {"Medium", "High"}:
+        st.success("This plan passed the current trust checks for service area, requested-drug fit, and evidence quality.")
+    else:
+        st.warning("Use this plan as decision support only. Verify service area, formulary details, and nearby pharmacy access before acting.")
+
+    metric_col1, metric_col2, metric_col3, metric_col4, metric_col5 = st.columns(5)
+    metric_col1.metric("Decision score", f"{float(plan_row.get('decision_score', 0.0)):.1f}")
+    metric_col2.metric("ML score", f"{float(plan_row.get('ml_score', 0.0)):.2f}")
+    metric_col3.metric("Coverage fit", str(plan_row.get("coverage_status", "Unknown")))
+    metric_col4.metric("Confidence", str(plan_row.get("confidence_band", "Unknown")))
+    metric_col5.metric("Estimated annual total", f"${float(plan_row.get('estimated_total_annual_cost', 0.0)):,.0f}")
+
+    reason_lines = []
+    decision_reason = str(plan_row.get("decision_reason", "") or "").strip()
+    if decision_reason:
+        reason_lines.append(decision_reason.capitalize())
+    if float(plan_row.get("coverage_pct_requested", 0.0) or 0.0) > 0:
+        reason_lines.append(f"Requested-drug coverage is {float(plan_row.get('coverage_pct_requested', 0.0)):.1f}%.")
+    nearest_preferred = float(access_summary.get("nearest_preferred_miles", 0.0) or 0.0)
+    if nearest_preferred > 0:
+        reason_lines.append(f"Nearest preferred pharmacy estimate: {nearest_preferred:.1f} miles.")
+    if float(cost_breakdown.get("annual_premium", 0.0) or 0.0) > 0:
+        reason_lines.append(f"Annual premium estimate: ${float(cost_breakdown.get('annual_premium', 0.0)):,.0f}.")
+
+    st.markdown("**Why it surfaced**")
+    for line in reason_lines[:4]:
+        st.write(f"- {line}")
+
+    uncovered_ndcs = [token.strip() for token in str(plan_row.get("uncovered_ndcs", "") or "").split(",") if token.strip()]
+    if uncovered_ndcs:
+        uncovered_display = []
+        for ndc in uncovered_ndcs:
+            drug_name = requested_name_map.get(ndc, "")
+            uncovered_display.append(f"{drug_name} (NDC {ndc})" if drug_name else f"NDC {ndc}")
+        st.markdown("**Requested medications still to verify**")
+        st.write(", ".join(uncovered_display))
+
+    info_col1, info_col2 = st.columns(2)
+    info_col1.markdown("**Warnings**")
+    if len(warning_flags) > 0:
+        for warning in warning_flags:
+            info_col1.write(f"- {warning}")
+    else:
+        info_col1.write("- No major warning flags were raised for the current inputs.")
+
+    info_col2.markdown("**Evidence gaps**")
+    if len(evidence_gaps) > 0:
+        for gap in evidence_gaps:
+            info_col2.write(f"- {gap}")
+    else:
+        info_col2.write("- The main evidence fields used by this run were available.")
+
+
+def render_recommendation_expanders(recommendation_df):
+    """Render per-plan decision-support details."""
+    if len(recommendation_df) == 0:
+        return
+
+    st.subheader("Plan Details")
+    for _, plan in recommendation_df.head(5).iterrows():
+        title = f"{int(plan.get('rank', 0))}. {plan['PLAN_NAME']} | {plan.get('coverage_status', 'Unknown')} | {plan.get('confidence_band', 'Unknown')}"
+        with st.expander(title):
+            cost_breakdown = _coerce_dict(plan.get("cost_breakdown", {}))
+            access_summary = _coerce_dict(plan.get("access_summary", {}))
+            warning_flags = _coerce_list(plan.get("warning_flags", []))
+            evidence_gaps = _coerce_list(plan.get("evidence_gaps", []))
+
+            metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+            metric_col1.metric("Annual premium", f"${float(cost_breakdown.get('annual_premium', 0.0)):,.0f}")
+            metric_col2.metric("Estimated OOP", f"${float(cost_breakdown.get('estimated_oop', 0.0)):,.0f}")
+            metric_col3.metric("Distance penalty", f"${float(cost_breakdown.get('distance_penalty', 0.0)):,.0f}")
+            metric_col4.metric("Nearest preferred", f"{float(access_summary.get('nearest_preferred_miles', 0.0)):.1f} mi")
+
+            st.markdown("**Why this plan**")
+            st.write(str(plan.get("decision_reason", "Balanced across cost, access, and medication fit.")))
+
+            st.markdown("**What to verify**")
+            if len(warning_flags) > 0:
+                for warning in warning_flags:
+                    st.write(f"- {warning}")
+            else:
+                st.write("- No major verification flags were raised.")
+
+            st.markdown("**What changes if assumptions change**")
+            change_lines = []
+            uncovered_component = float(_coerce_dict(cost_breakdown.get("oop_components", {})).get("uncovered_component", 0.0) or 0.0)
+            if uncovered_component > 0:
+                change_lines.append("This plan is sensitive to the requested medications that are not currently covered.")
+            if float(access_summary.get("distance_miles", 0.0) or 0.0) > 0:
+                change_lines.append("Changing the preferred ZIP or pharmacy distance tolerance could reorder this plan.")
+            if len(evidence_gaps) > 0:
+                change_lines.append("Better network or formulary evidence could change confidence more than rank.")
+            if len(change_lines) == 0:
+                change_lines.append("This plan looks relatively stable under the current assumptions.")
+            for line in change_lines:
+                st.write(f"- {line}")
+
+            if len(evidence_gaps) > 0:
+                st.markdown("**Evidence gaps**")
+                for gap in evidence_gaps:
+                    st.write(f"- {gap}")
+
+
+def render_research_mode(model_data):
+    """Render the research and evaluation page."""
+    st.subheader("Research / Evaluation")
+    st.caption("This mode compares the trained LightGBM ranker against a transparent heuristic baseline, with deterministic sampling and subgroup reporting.")
+
+    filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
+    sample_size = filter_col1.slider("Beneficiary sample", min_value=100, max_value=2000, value=500, step=100)
+    risk_segment = filter_col2.selectbox("Risk segment", ["All", "Low", "Medium", "High"], index=0)
+    insulin_filter = filter_col3.selectbox("Insulin slice", ["All", "Insulin users only", "Non-insulin users only"], index=0)
+    state_filter = filter_col4.selectbox("State filter", get_research_states(), index=0)
+
+    control_col1, control_col2 = st.columns(2)
+    research_seed = control_col1.number_input(
+        "Research seed",
+        min_value=1,
+        max_value=100000,
+        value=DEFAULT_RESEARCH_SEED,
+        step=1,
+    )
+    run_research = control_col2.button("Run research evaluation", type="primary", use_container_width=True)
+
+    if run_research:
+        with st.spinner("Running deterministic evaluation sample and scoring pipeline..."):
+            sample_df = load_research_sample(
+                get_database(),
+                bene_limit=int(sample_size),
+                seed=int(research_seed),
+                risk_segment=risk_segment,
+                insulin_filter=insulin_filter,
+                state_filter=state_filter,
+            )
+            if len(sample_df) == 0:
+                st.session_state["research_outputs"] = {"error": "No research sample rows matched the current filters."}
+            else:
+                scored_df = score_research_sample(sample_df, model_data)
+                summary_df, detail_df = evaluate_model_vs_baseline(scored_df)
+                stability_df = compute_preference_stability(scored_df)
+                diagnostics_df = build_data_coverage_diagnostics(scored_df)
+                fairness_tables = build_fairness_tables(detail_df)
+                st.session_state["research_outputs"] = {
+                    "summary_df": summary_df,
+                    "detail_df": detail_df,
+                    "stability_df": stability_df,
+                    "diagnostics_df": diagnostics_df,
+                    "fairness_tables": fairness_tables,
+                    "sample_df": sample_df,
+                    "seed": int(research_seed),
+                }
+
+    outputs = st.session_state.get("research_outputs")
+    if not outputs:
+        st.info("Set the sample filters and run the evaluation to compare ML performance against the transparent baseline.")
+        return
+    if outputs.get("error"):
+        st.warning(outputs["error"])
+        return
+
+    summary_df = outputs["summary_df"]
+    detail_df = outputs["detail_df"]
+    stability_df = outputs["stability_df"]
+    diagnostics_df = outputs["diagnostics_df"]
+    fairness_tables = outputs["fairness_tables"]
+
+    st.markdown("#### Model vs baseline summary")
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+    chart_df = summary_df.melt(
+        id_vars=["method"],
+        value_vars=["avg_top1_cost_regret", "avg_requested_drug_coverage", "best_plan_hit_rate"],
+        var_name="metric",
+        value_name="value",
+    )
+    fig = px.bar(chart_df, x="metric", y="value", color="method", barmode="group", title="ML model vs transparent baseline")
+    st.plotly_chart(fig, use_container_width=True)
+
+    diag_col1, diag_col2 = st.columns(2)
+    with diag_col1:
+        st.markdown("#### Data coverage diagnostics")
+        st.dataframe(diagnostics_df, use_container_width=True, hide_index=True)
+    with diag_col2:
+        st.markdown("#### Recommendation stability")
+        st.dataframe(stability_df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Fairness and subgroup slices")
+    fairness_tabs = st.tabs(["Insulin", "Risk", "Density", "State", "County"])
+    tab_map = [
+        ("insulin", fairness_tabs[0]),
+        ("risk_segment", fairness_tabs[1]),
+        ("density", fairness_tabs[2]),
+        ("state", fairness_tabs[3]),
+        ("county", fairness_tabs[4]),
+    ]
+    for key, tab in tab_map:
+        with tab:
+            table = fairness_tables.get(key)
+            if table is None or len(table) == 0:
+                st.info(f"No subgroup rows were available for {key}.")
+            else:
+                st.dataframe(table, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Methodology summary")
+    st.markdown(
+        """
+        - Candidate rows come from `ml.training_plan_pairs`.
+        - Sampling is deterministic for a given seed and filter set.
+        - The ML model is compared against a transparent heuristic baseline built from cost, access, and requested-drug coverage.
+        - Output tables expose cost regret, requested-drug coverage satisfaction, access burden, and subgroup performance slices.
+        - Sparse network or formulary evidence should be interpreted as a limitation, not hidden behind a single score.
+        """
+    )
+
+    download_col1, download_col2 = st.columns(2)
+    download_col1.download_button(
+        label="Download summary report (CSV)",
+        data=summary_df.to_csv(index=False),
+        file_name=f"research_summary_{outputs['seed']}.csv",
+        mime="text/csv",
+    )
+    download_col2.download_button(
+        label="Download detailed evaluation (CSV)",
+        data=detail_df.to_csv(index=False),
+        file_name=f"research_detail_{outputs['seed']}.csv",
+        mime="text/csv",
+    )
+
+
+def main():
+    """Trust-first decision support and research entrypoint."""
+    init_app_state()
+
+    st.markdown('<div class="main-header">Medicare Part D Decision Support</div>', unsafe_allow_html=True)
+    st.markdown("**Decision support for beneficiaries, plus reproducible evaluation for research.**")
+
+    model_data = load_trained_model()
+    if model_data is None:
+        st.error("Trained model not found. Please run `python ml_model/train_model_from_db.py` first.")
+        st.stop()
+
+    model_version = get_model_version(model_data)
+    data_snapshot = get_data_snapshot_id()
+    stats = model_data.get("training_stats", {})
+
+    st.sidebar.header("Workspace")
+    app_mode = st.sidebar.radio(
+        "Mode",
+        ["Beneficiary Decision Support", "Research / Evaluation"],
+        index=0,
+    )
+    st.sidebar.caption(f"Model version: `{model_version}`")
+    st.sidebar.caption(f"Data snapshot: `{data_snapshot}`")
+    st.sidebar.caption(f"Seed: `{DEFAULT_RESEARCH_SEED}`")
+    if "test_ndcg@3" in stats:
+        st.sidebar.metric("Test NDCG@3", f"{float(stats.get('test_ndcg@3', 0.0)):.3f}")
+
+    if app_mode == "Research / Evaluation":
+        render_research_mode(model_data)
+        return
+
+    profile_tab, medication_tab, preference_tab, results_tab = st.tabs(
+        ["1. Profile", "2. Medications", "3. Preferences", "4. Results"]
+    )
+
+    with profile_tab:
+        profile_inputs = render_profile_step()
+
+    with medication_tab:
+        medication_summary = render_medication_step()
+
+    with preference_tab:
+        preference_inputs = render_preferences_step(medication_summary)
+
+    with results_tab:
+        st.subheader("4. Results")
+        st.caption("Recommendations are only shown strongly when local eligibility, medication fit, and evidence quality all clear the trust checks.")
+
+        run_recommendation = st.button("Run decision support", type="primary", use_container_width=True)
+        if run_recommendation:
+            with st.spinner("Running service-area checks, requested-drug coverage, cost estimation, and ML reranking..."):
+                result = execute_decision_support_run(
+                    profile_inputs,
+                    medication_summary,
+                    preference_inputs,
+                    model_data,
+                )
+            if result.get("error"):
+                st.error(result["error"])
+            else:
+                st.session_state["active_run_id"] = result["run_id"]
+                st.session_state["recommendation_runs"][result["run_id"]] = result
+
+        active_run_id = st.session_state.get("active_run_id")
+        if not active_run_id:
+            st.info("Complete the first three steps, then run decision support to generate ranked plans and audit artifacts.")
+            return
+
+        result = st.session_state["recommendation_runs"].get(active_run_id)
+        if not result:
+            st.info("No active recommendation run is stored yet.")
+            return
+
+        recommendation_df = result["recommendations"]
+        comparison_df = result["comparison_recommendations"]
+        feature_coverage = result["feature_coverage"]
+        audit = result["audit"]
+
+        if result["comparison_only"]:
+            st.warning(result["result_message"])
+        elif result["trusted_recommendation"]:
+            st.success(result["result_message"])
+        else:
+            st.info(result["result_message"])
+
+        trust_col1, trust_col2, trust_col3, trust_col4 = st.columns(4)
+        trust_col1.metric("Candidate plans", int(feature_coverage.get("candidate_plans", 0)))
+        trust_col2.metric("Eligible plans", int(feature_coverage.get("eligible_plans", 0)))
+        trust_col3.metric("With network metrics", int(feature_coverage.get("plans_with_network_metrics", 0)))
+        trust_col4.metric("With pharmacy-distance data", int(feature_coverage.get("plans_with_pharmacy_distance_data", 0)))
+
+        if len(recommendation_df) == 0:
+            st.warning("No plans were available after the staged trust checks.")
+            return
+
+        featured_plan = recommendation_df.iloc[0]
+        render_featured_plan(featured_plan, result["requested_name_map"])
+
+        st.subheader("Side-by-Side Comparison")
+        comparison_view = recommendation_df.head(5)[
+            [
+                "rank",
+                "PLAN_NAME",
+                "eligibility_status",
+                "coverage_status",
+                "coverage_pct_requested",
+                "estimated_total_annual_cost",
+                "decision_score",
+                "ml_score",
+                "confidence_band",
+            ]
+        ].copy()
+        comparison_view = comparison_view.rename(
+            columns={
+                "PLAN_NAME": "Plan",
+                "eligibility_status": "Eligibility",
+                "coverage_status": "Medication fit",
+                "coverage_pct_requested": "Coverage %",
+                "estimated_total_annual_cost": "Estimated annual total",
+                "decision_score": "Decision score",
+                "ml_score": "ML score",
+                "confidence_band": "Confidence",
+            }
+        )
+        st.dataframe(comparison_view, use_container_width=True, hide_index=True)
+
+        render_recommendation_expanders(recommendation_df)
+
+        if len(comparison_df) > 0:
+            with st.expander("Nearby county comparisons"):
+                st.caption("These plans are outside the selected county service area and are displayed for comparison only.")
+                nearby_view = comparison_df.head(5)[
+                    [
+                        "PLAN_NAME",
+                        "eligibility_status",
+                        "coverage_status",
+                        "coverage_pct_requested",
+                        "estimated_total_annual_cost",
+                        "confidence_band",
+                    ]
+                ].copy()
+                nearby_view = nearby_view.rename(
+                    columns={
+                        "PLAN_NAME": "Plan",
+                        "eligibility_status": "Eligibility",
+                        "coverage_status": "Medication fit",
+                        "coverage_pct_requested": "Coverage %",
+                        "estimated_total_annual_cost": "Estimated annual total",
+                        "confidence_band": "Confidence",
+                    }
+                )
+                st.dataframe(nearby_view, use_container_width=True, hide_index=True)
+
+        with st.expander("Assumptions and trust signals"):
+            st.json(audit["search_context"])
+            st.json(result["public_contract"])
+
+        with st.expander("County access context"):
+            render_county_access_visualization(
+                result["beneficiary_profile"]["state"],
+                result["beneficiary_profile"]["county"],
+                result["beneficiary_profile"]["state_code"],
+                result["beneficiary_profile"]["county_code"],
+            )
+
+        export_col1, export_col2 = st.columns(2)
+        export_col1.download_button(
+            label="Download recommendation report (CSV)",
+            data=serialize_nested_columns(recommendation_df).to_csv(index=False),
+            file_name=f"recommendations_{active_run_id}.csv",
+            mime="text/csv",
+        )
+        export_col2.download_button(
+            label="Download audit record (JSON)",
+            data=json.dumps(audit, indent=2),
+            file_name=f"recommendation_audit_{active_run_id}.json",
+            mime="application/json",
+        )
 
 
 if __name__ == "__main__":

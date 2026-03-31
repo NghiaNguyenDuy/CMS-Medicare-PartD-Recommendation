@@ -185,8 +185,35 @@ class DatabaseManager:
         Returns:
             list: Table names
         """
-        tables = self.query_all("SHOW TABLES")
-        return [table[0] for table in tables]
+        tables = self.query_all(
+            """
+            SELECT table_schema, table_name
+            FROM information_schema.tables
+            WHERE table_schema NOT IN ('information_schema', 'pg_catalog')
+            ORDER BY table_schema, table_name
+            """
+        )
+        return [f"{schema}.{table}" for schema, table in tables]
+
+    def has_table(self, table_name):
+        """
+        Return True when a schema-qualified table exists.
+        """
+        if "." not in str(table_name):
+            schema = "main"
+            table = str(table_name)
+        else:
+            schema, table = str(table_name).split(".", 1)
+
+        result = self.query_one(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.tables
+            WHERE table_schema = ? AND table_name = ?
+            """,
+            [schema, table],
+        )
+        return bool(result[0] > 0)
 
     def close(self):
         """
